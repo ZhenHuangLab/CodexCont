@@ -8,6 +8,8 @@
 编码代理  ->  CodexCont  ->  Codex / Responses API
 ```
 
+> **用 AI Agent 安装？** 把 [`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md) 交给你的 Agent —— 这是一份专为 AI Agent 在你机器上逐步执行而写的安装手册。
+
 ## 免责声明
 
 本项目是对已观察到的 OpenAI Codex 推理截断机制的明确绕过。若使用本中间件的行为被视为滥用、违反服务条款、导致费用异常增加，或造成其他不良后果，均由使用者自行承担责任。
@@ -187,3 +189,7 @@ config.example.toml # 示例运行配置；复制为 config.toml 后本地使用
 - 非流式请求当前会透传，不进行折叠。
 - 截断检测器是针对已观察到的 `518 * n - 2` 指纹设计的。
 - 可选的 `repair_followup = "stateful"` 使用进程内内存状态；多代理实例之间不会共享。
+
+## 致谢
+
+感谢 LINUX DO 社区的相关讨论，没有这些讨论，也就没有本项目。特别感谢 LINUX DO 社区的 @shinorochi 和 @dskdkj 一同明确截断机制和 GPT 的思考模型，感谢 @shinorochi 提出的基于 commentary 输入而非工具调用伪造的更好方案。

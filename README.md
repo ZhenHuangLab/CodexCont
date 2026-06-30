@@ -8,6 +8,8 @@ This project is a small Starlette proxy that sits between a coding agent and an 
 Coding agent  ->  CodexCont  ->  Codex / Responses API
 ```
 
+> **Installing via an AI agent?** Hand it [`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md) — a step-by-step runbook written for an AI agent to execute on your machine.
+
 ## Disclaimer
 
 This project explicitly bypasses the observed OpenAI Codex reasoning-truncation behavior. If your use of this middleware is considered abusive, violates service terms, increases costs unexpectedly, or causes any other adverse consequences, you are solely responsible for those consequences.
@@ -187,3 +189,7 @@ config.example.toml # example runtime configuration; copy to config.toml for loc
 - Non-streaming requests are currently passed through rather than folded.
 - The truncation detector is intentionally specific to the observed `518 * n - 2` fingerprint.
 - Optional `repair_followup = "stateful"` uses in-memory process-local state; it is not shared across multiple proxy instances.
+
+## Acknowledgements
+
+This project would not exist without the discussions in the LINUX DO community. Special thanks to **@shinorochi** and **@dskdkj** of the LINUX DO community for jointly pinning down the truncation mechanism and GPT's thinking model, and to **@shinorochi** for proposing the better approach based on `commentary` input rather than faked tool calls.
