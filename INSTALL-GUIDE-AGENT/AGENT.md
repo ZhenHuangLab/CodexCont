@@ -32,6 +32,10 @@ pointed at it instead of at the real upstream.
 5. **Idempotent.** It is safe to re-run any step. Check before you create; don't clobber.
 6. **Repo root.** Run repo commands from the directory that contains `run.py`,
    `pyproject.toml`, and `config.example.toml`. Confirm with `ls`.
+7. **Leftovers from a previous attempt are common.** Before assuming a clean slate, run the
+   pre-check in §2. A stray `[model_providers.codexcont]` block, an old
+   `~/.codexcont-backup/` dir, or a process still holding the port will make later steps
+   behave unexpectedly if you don't account for them first.
 
 ---
 
@@ -74,6 +78,19 @@ python -m pip --version
 **Verify:** Python ≥ 3.12 is available, and you are in the repo root (`ls` shows `run.py`,
 `pyproject.toml`, `config.example.toml`). If Python is too old, stop and ask the user to
 install Python 3.12+ (or point you at an existing one).
+
+**Also check for leftovers from a previous/aborted install attempt**, since these are common
+and can confuse later diagnosis if you don't know about them upfront:
+
+```bash
+ls -la ~/.codexcont-backup/ 2>/dev/null              # old backups not cleaned up?
+grep -n "^model_provider\|\[model_providers\." ~/.codex/config.toml 2>/dev/null   # stray provider block already present?
+lsof -i :8787                                         # default port already occupied?
+```
+
+If any of these show something, **tell the user what you found** before proceeding — don't
+silently assume a clean environment. A pre-existing `[model_providers.codexcont]` block
+should be normalized/reused in §5 rather than duplicated.
 
 ---
 
@@ -151,6 +168,12 @@ Then write a restore manifest **next to the backup** (not in the repo). Create
 
 **Verify:** `ls "$BACKUP"` shows the copied configs and `RESTORE.md`. Tell the user where the
 backup lives. Only now may you edit agent configs.
+
+> **Base `RESTORE.md` on what the file actually contains right now**, not on what a template
+> or an older backup says it should contain. If the §2 pre-check found a leftover
+> `[model_providers.codexcont]` block from a prior attempt, record that fact explicitly in
+> `RESTORE.md` and reuse/normalize that block in §5 instead of adding a duplicate — only add
+> what's actually missing (typically just the top-level `model_provider = "codexcont"` line).
 
 ---
 
@@ -230,14 +253,39 @@ values masked**.
 Remind the user: **do not commit `config.toml`, `rt.json`, or `free_rt.json`** — they may
 hold secrets.
 
+> **If the user needs a proxy (Clash/mihomo/等) to reach `chatgpt.com`/OpenAI at all**, know
+> this now, before §6: CodexCont's outbound HTTP client only honors `http_proxy` /
+> `https_proxy` / `all_proxy` **environment variables of the process that starts it** — it
+> does **not** read the OS-level system proxy settings (e.g. `scutil --proxy` on macOS). A
+> shell where the user manually toggles a proxy function, or a double-clicked shortcut, often
+> has none of these set. Ask the user whether their network needs a proxy to reach OpenAI; if
+> yes, plan to export `http_proxy`/`https_proxy` in the same process that runs `run.py` (see
+> §6 and the §8 shortcut). If they reach it directly, skip this.
+
 ---
 
 ## §6 — Run the proxy and verify it's alive
 
-Start the server (it must keep running — see §8). Run it in the background so you can probe
-it:
+If §2 found a process already on the port, clean it up first — don't assume `kill <pid>`
+alone did it: a plain `kill` may not have finished processing, and a launcher like
+`uv run python run.py` spawns a child process, so the PID you have may not be the one
+actually holding the socket.
 
 ```bash
+lsof -i :8787            # find the PID actually LISTENing on the port
+kill -9 <that-pid>
+sleep 1
+lsof -i :8787            # confirm it's empty before restarting
+```
+
+Start the server (it must keep running — see §8). If §5 determined the user needs a proxy to
+reach OpenAI, export it in this same shell/process before starting (see also §8's shortcut):
+
+```bash
+# only if needed (see §5):
+# export http_proxy="http://127.0.0.1:<their-proxy-port>"
+# export https_proxy="http://127.0.0.1:<their-proxy-port>"
+
 # Method A:
 uv run python run.py
 # Method B:
@@ -259,6 +307,13 @@ curl -sS -o /dev/null -w "%{http_code}\n" -X POST \
 A numeric HTTP code (e.g. `400`/`401`/`502` from upstream) = the proxy is up. A connection
 error = it is not running; see §9.
 
+> **If you (the agent) are executing this `curl` from inside your own network-sandboxed
+> shell** (e.g. only an allow-listed set of domains is reachable), a `403`/connection error
+> here can be a false negative caused by *your own* sandbox blocking the proxy's outbound call
+> to `chatgpt.com` — not a bug in CodexCont. Re-run this verification with full network access
+> for your shell (e.g. Cursor's `required_permissions: ["full_network"]` or `["all"]`) before
+> concluding the proxy itself is broken.
+
 ---
 
 ## §7 — Point the user's agent(s) at the proxy
@@ -267,6 +322,11 @@ The proxy's local endpoint base is `http://127.0.0.1:8787/v1` (clients that spea
 append `/responses` themselves, matching the proxy's listen path `/v1/responses`).
 
 ### 7a — Codex (`~/.codex/config.toml`)
+
+> **⚠️ Codex only re-reads `config.toml` on a full restart.** After any edit here, the user
+> must **fully quit the Codex app and relaunch it** — closing the chat window/tab is not
+> enough. Do this before attempting §7c verification, or you'll be debugging a config that
+> isn't actually loaded yet.
 
 > **⚠️ Switching Codex's `model_provider` hides the user's existing conversation history.**
 > Past sessions are grouped per provider, so they stop appearing under a different one — they
@@ -371,6 +431,44 @@ If the agent works but `proxy_rounds` never appears, continuation simply wasn't 
 for that prompt (it only fires on the truncation fingerprint) — that's fine. If the agent
 errors, see §9.
 
+**Ignore `GET /v1/models` 404s — this is expected noise.** Some clients (Codex included)
+periodically poll `GET /v1/models` to list models; CodexCont only implements
+`POST /v1/responses`, so this route is always 404. It is unrelated to whether real chat
+requests work. Judge success only by `POST /v1/responses` status codes and the
+`middleware.proxy:` round logs described above.
+
+> **🛑 If the client reports a `404` on `/v1/responses` but the proxy's own log shows no
+> record of that request at all**, do not assume CodexCont is broken — the most likely cause
+> is a **local system proxy tool (Clash/mihomo/Surge, etc.) intercepting loopback traffic**
+> meant for `127.0.0.1`. Many such tools add `127.0.0.1`/`localhost` to the OS proxy's
+> "bypass/exceptions" list, but **many client apps (especially Rust/Node/Electron/Tauri —
+> plausibly including Codex) don't honor that OS-level bypass list** and instead send every
+> request through the configured proxy port. If that proxy's rules have no
+> `DIRECT` rule for `127.0.0.0/8`, it forwards the "unrecognized" local request to a remote
+> node, which can't reach the user's own machine and returns a 404.
+>
+> **To confirm:** manually `curl` the exact same URL (as in §6). If `curl` gets a normal
+> numeric status *and it's logged by the proxy*, but the real client's request never appears
+> in the proxy log, this is almost certainly the cause — do not start debugging or changing
+> CodexCont's code/config for it.
+>
+> **Fix (offer the user a choice, don't silently edit their proxy tool's config):**
+> 1. In the proxy tool's bypass/exceptions list, ensure `127.0.0.1, localhost` (and ideally
+>    private ranges) are present.
+> 2. Or, at the top of its `rules:`, add:
+>    ```yaml
+>    rules:
+>      - IP-CIDR,127.0.0.0/8,DIRECT
+>      - IP-CIDR,::1/128,DIRECT
+>    ```
+> 3. Or, without touching the proxy tool, set env-level `NO_PROXY` and have the user **fully
+>    quit and relaunch** the client app (not just close the window — a new process must
+>    inherit the new env):
+>    ```bash
+>    launchctl setenv NO_PROXY "127.0.0.1,localhost,::1"
+>    launchctl setenv no_proxy "127.0.0.1,localhost,::1"
+>    ```
+
 ---
 
 ## §8 — Keep it running + optional shortcut
@@ -394,6 +492,10 @@ yes, create one appropriate to the OS and to how they installed it (Method A vs 
 - **macOS** — a `start-codexcont.command` (then `chmod +x` it) on the Desktop:
   ```bash
   #!/bin/bash
+  # Uncomment and adjust if the user's network needs a proxy to reach OpenAI (see §5/§6):
+  # export http_proxy="http://127.0.0.1:<their-proxy-port>"
+  # export https_proxy="http://127.0.0.1:<their-proxy-port>"
+  # export no_proxy="127.0.0.1,localhost,::1"
   cd "/path/to/gptpoc" && uv run python run.py
   ```
 - **Linux** — a `~/.local/share/applications/codexcont.desktop` or a shell script:
@@ -421,8 +523,13 @@ create in the `RESTORE.md` manifest from §3.5 so it can be removed on uninstall
 | Tool seems to do nothing; no `proxy_rounds` ever | (a) Reasoning stripped by a sub2api relay (§3.3); (b) reasoning disabled; (c) prompt simply didn't truncate | Use an upstream that preserves reasoning; ensure reasoning isn't disabled; this is expected when no truncation occurs. |
 | `python: command not found` / wrong version | Python < 3.12 or not on PATH | Install/point at Python 3.12+. |
 | `uv: command not found` | uv not installed | Install uv (§4) or use Method B. |
-| Port already in use | Another process on 8787 | Change `[server].port` and update the client `base_url` to match. |
+| Port already in use | Another process on 8787 | `lsof -i :8787` for the real listening PID, `kill -9` it, `sleep 1`, confirm empty, then change `[server].port` only if it must coexist with something else. |
 | Higher first-token latency on final answer | Expected — final text is buffered until the round proves it wasn't truncated | Not a bug; document to the user. |
+| Your own `curl` verification (§6) gets `403`/refused, but only when *you* (the agent) run it | Your shell is itself network-sandboxed and blocks the proxy's outbound call to `chatgpt.com` | Re-run the verification with full/unrestricted network access for your own shell; a numeric status code then confirms the proxy is fine. |
+| Real client gets `404` on `/v1/responses`, but the proxy's own log has **no record** of that request | A local system proxy tool (Clash/mihomo/Surge) is intercepting loopback traffic instead of routing it `DIRECT`, and returning its own 404 | See the boxed guidance in §7c: add a `127.0.0.0/8 DIRECT` rule / bypass entry in the proxy tool, or set `NO_PROXY` + fully relaunch the client. Do not touch CodexCont. |
+| Client periodically logs `GET /v1/models` → 404 | Expected polling noise; CodexCont doesn't implement this route | Ignore; judge health via `POST /v1/responses` instead (§7c). |
+| CodexCont can't reach `chatgpt.com`/OpenAI at all (proxy up, but every upstream call fails/times out) | The user's network needs a proxy, but the process running `run.py` has no `http_proxy`/`https_proxy` env set (CodexCont doesn't read macOS system proxy settings) | Export `http_proxy`/`https_proxy` in the same shell/script that starts `run.py` (see §5/§6/§8). |
+| Config edits to `~/.codex/config.toml` don't seem to take effect | Codex only reads config at startup | Have the user fully quit and relaunch Codex (not just close the window). |
 
 ---
 
