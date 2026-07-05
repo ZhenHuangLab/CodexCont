@@ -6,6 +6,7 @@ calls of each round are buffered as *tentative output* and either discarded
 synthetic continue machinery never reaches the agent. Truncation is the SOLE
 gate — message and function_call output are treated identically.
 """
+
 from __future__ import annotations
 
 import json
@@ -56,7 +57,9 @@ async def open_passthrough(
     headers: dict[str, str],
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
-    req = client.build_request("POST", url, content=raw_body, headers=headers, timeout=None)
+    req = client.build_request(
+        "POST", url, content=raw_body, headers=headers, timeout=None
+    )
     return await client.send(req, stream=True)
 
 
@@ -84,7 +87,9 @@ def _sum_usage(acc: dict[str, Any], usage: dict[str, Any] | None) -> None:
     otd = usage.get("output_tokens_details") or {}
     if otd.get("reasoning_tokens") is not None:
         d = acc.setdefault("output_tokens_details", {})
-        d["reasoning_tokens"] = d.get("reasoning_tokens", 0) + int(otd["reasoning_tokens"])
+        d["reasoning_tokens"] = d.get("reasoning_tokens", 0) + int(
+            otd["reasoning_tokens"]
+        )
 
 
 def _fmt_usage(usage: dict[str, Any] | None) -> str:
@@ -135,7 +140,9 @@ def _flush_entry(
 
     # Re-chunk: replace the original output_text.delta run with uniform slices.
     full_text = "".join(
-        e.get("delta", "") for e in events if e.get("type") == "response.output_text.delta"
+        e.get("delta", "")
+        for e in events
+        if e.get("type") == "response.output_text.delta"
     )
     emitted = False
     for ev in events:
@@ -172,14 +179,34 @@ def _commentary_events(item: dict[str, Any], ds_oi: int, seq: _Seq) -> Iterator[
     head = {"id": iid, "type": "message", "role": "assistant", "phase": "commentary"}
     evs = [
         {"type": "response.output_item.added", "output_index": ds_oi, "item": head},
-        {"type": "response.content_part.added", "output_index": ds_oi, "item_id": iid,
-         "content_index": 0, "part": {"type": "output_text", "text": ""}},
-        {"type": "response.output_text.delta", "output_index": ds_oi, "item_id": iid,
-         "content_index": 0, "delta": text},
-        {"type": "response.output_text.done", "output_index": ds_oi, "item_id": iid,
-         "content_index": 0, "text": text},
-        {"type": "response.content_part.done", "output_index": ds_oi, "item_id": iid,
-         "content_index": 0, "part": {"type": "output_text", "text": text}},
+        {
+            "type": "response.content_part.added",
+            "output_index": ds_oi,
+            "item_id": iid,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": ds_oi,
+            "item_id": iid,
+            "content_index": 0,
+            "delta": text,
+        },
+        {
+            "type": "response.output_text.done",
+            "output_index": ds_oi,
+            "item_id": iid,
+            "content_index": 0,
+            "text": text,
+        },
+        {
+            "type": "response.content_part.done",
+            "output_index": ds_oi,
+            "item_id": iid,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text},
+        },
         {"type": "response.output_item.done", "output_index": ds_oi, "item": item},
     ]
     for ev in evs:
@@ -211,7 +238,9 @@ def _agent_usage(
     final_nonreason = 0
     if flushed_final and final_round:
         fo = final_round.get("output_tokens") or 0
-        fr = (final_round.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
+        fr = (final_round.get("output_tokens_details") or {}).get(
+            "reasoning_tokens"
+        ) or 0
         final_nonreason = max(0, fo - fr)
     out_tok = reasoning + final_nonreason
     usage: dict[str, Any] = {
@@ -238,6 +267,22 @@ def _with_proxy_metadata(
     if stopped_reason:
         md["proxy_stopped_reason"] = stopped_reason
     resp["metadata"] = md
+
+
+def _record_chain(
+    chain_store: Any | None,
+    base_response: dict[str, Any] | None,
+    orig_input: list[Any],
+    final_output: list[dict[str, Any]],
+) -> None:
+    """Cache this turn's effective full input under the id the agent will see,
+    so a later request that chains off it via `previous_response_id` can be
+    resolved locally -- see `codex.resolve_previous_response_id`."""
+    if chain_store is None or not base_response:
+        return
+    rid = base_response.get("id")
+    if rid:
+        chain_store.set(rid, [*orig_input, *final_output])
 
 
 def _reconstruct_terminal(
@@ -294,12 +339,16 @@ async def fold_stream(
     first_response: httpx.Response,
     id_store: Any | None = None,
     url: str | None = None,
+    chain_store: Any | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
     against `url` (the resolved upstream, which may come from the
     Responses-API-Base header). `id_store` records continuation reasoning ids
-    when repair_followup="stateful".
+    when repair_followup="stateful". `chain_store` records this turn's
+    effective full input under the response id the agent sees, so a later
+    request chaining off it via `previous_response_id` can be resolved
+    locally (see `codex.resolve_previous_response_id`).
     """
     cont = cfg.cont
     url = url or cfg.upstream.url
@@ -309,11 +358,19 @@ async def fold_stream(
     ds_oi = 0
     base_response: dict[str, Any] | None = None
     saw_done = False
-    final_output: list[dict[str, Any]] = []  # reasoning (all rounds) + final flushed items
-    total_usage: dict[str, Any] = {}  # summed across rounds → metadata.proxy_billed_usage
-    first_usage: dict[str, Any] | None = None  # round-1 usage → agent-facing input/cached
+    final_output: list[
+        dict[str, Any]
+    ] = []  # reasoning (all rounds) + final flushed items
+    total_usage: dict[
+        str, Any
+    ] = {}  # summed across rounds → metadata.proxy_billed_usage
+    first_usage: dict[str, Any] | None = (
+        None  # round-1 usage → agent-facing input/cached
+    )
     replay_tail: list[Any] = []
-    rounds_info: list[dict[str, Any]] = []  # per-round breakdown → metadata.proxy_rounds
+    rounds_info: list[
+        dict[str, Any]
+    ] = []  # per-round breakdown → metadata.proxy_rounds
 
     response = first_response
     round_no = 0
@@ -370,7 +427,12 @@ async def fold_stream(
                     else:  # message | function_call → buffer (tentative output)
                         item_kind[up_oi] = "buffered"
                         out_buffer.append(
-                            {"oi": up_oi, "itype": item.get("type"), "events": [ev], "item": item}
+                            {
+                                "oi": up_oi,
+                                "itype": item.get("type"),
+                                "events": [ev],
+                                "item": item,
+                            }
                         )
                     continue
 
@@ -403,14 +465,18 @@ async def fold_stream(
             rt = reasoning_tokens(usage)
             n = tier_n(rt, cont.truncation_step)
             rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
-            has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
+            has_enc = bool(
+                round_reasoning and round_reasoning[-1].get("encrypted_content")
+            )
             within_caps = cont.max_total_output_tokens == 0 or (
                 total_usage.get("output_tokens", 0) < cont.max_total_output_tokens
             )
             do_continue = (
                 cont.enabled
                 and saw_terminal
-                and should_continue(rt, min_n=cont.min_n, max_n=cont.max_n, step=cont.truncation_step)
+                and should_continue(
+                    rt, min_n=cont.min_n, max_n=cont.max_n, step=cont.truncation_step
+                )
                 and has_enc
                 and round_no <= cont.max_continue
                 and within_caps
@@ -430,12 +496,20 @@ async def fold_stream(
 
             buffered = [e["itype"] for e in out_buffer]
             decision = (
-                "continue" if do_continue
-                else "upstream_eof" if not saw_terminal
+                "continue"
+                if do_continue
+                else "upstream_eof"
+                if not saw_terminal
                 else stopped_reason or "clean"
             )
-            log.info("round %d: %s | n=%s buffered=%s -> %s",
-                     round_no, _fmt_usage(usage), n, buffered or "[]", decision)
+            log.info(
+                "round %d: %s | n=%s buffered=%s -> %s",
+                round_no,
+                _fmt_usage(usage),
+                n,
+                buffered or "[]",
+                decision,
+            )
 
             await response.aclose()
 
@@ -444,7 +518,11 @@ async def fold_stream(
                 if cont.method == "commentary":
                     marker_items = [commentary_message(cont.marker_text)]
                 else:  # tool_pair (legacy)
-                    if cont.repair_followup == "stateful" and id_store is not None and last_id:
+                    if (
+                        cont.repair_followup == "stateful"
+                        and id_store is not None
+                        and last_id
+                    ):
                         id_store.add(last_id)  # record id for cross-turn re-insertion
                     call, output = continue_pair(
                         last_id,
@@ -475,21 +553,35 @@ async def fold_stream(
                     base_body,
                     input_items=orig_input + replay_tail,
                     force_include_encrypted=cfg.stream.force_include_encrypted,
-                    drop_previous_response_id=True,
                 )
                 response = await open_round(client, url, payload, headers)
                 if response.status_code >= 400:
                     body = (await response.aread())[:2000]
                     await response.aclose()
-                    log.warning("continuation round %d failed: %s %s", round_no + 1,
-                                response.status_code, body)
-                    log.info("done: %d round(s) | %s | status=incomplete stop=upstream_error",
-                             round_no, _fmt_usage(total_usage))
+                    log.warning(
+                        "continuation round %d failed: %s %s",
+                        round_no + 1,
+                        response.status_code,
+                        body,
+                    )
+                    log.info(
+                        "done: %d round(s) | %s | status=incomplete stop=upstream_error",
+                        round_no,
+                        _fmt_usage(total_usage),
+                    )
+                    _record_chain(chain_store, base_response, orig_input, final_output)
                     yield serialize_event(
                         _synthetic_incomplete(
-                            base_response, final_output,
-                            _agent_usage(first_usage, total_usage, usage, flushed_final=False),
-                            seq(), "upstream_error", rounds_info, total_usage)
+                            base_response,
+                            final_output,
+                            _agent_usage(
+                                first_usage, total_usage, usage, flushed_final=False
+                            ),
+                            seq(),
+                            "upstream_error",
+                            rounds_info,
+                            total_usage,
+                        )
                     )
                     return
                 continue
@@ -501,13 +593,24 @@ async def fold_stream(
                 # real final answer. Keep only the reasoning already live-streamed
                 # and mark the response incomplete (#7).
                 log.warning("round %d: upstream EOF with no terminal event", round_no)
-                log.info("done: %d round(s) | %s | status=incomplete stop=upstream_eof",
-                         round_no, _fmt_usage(total_usage))
+                log.info(
+                    "done: %d round(s) | %s | status=incomplete stop=upstream_eof",
+                    round_no,
+                    _fmt_usage(total_usage),
+                )
+                _record_chain(chain_store, base_response, orig_input, final_output)
                 yield serialize_event(
                     _synthetic_incomplete(
-                        base_response, final_output,
-                        _agent_usage(first_usage, total_usage, usage, flushed_final=False),
-                        seq(), "upstream_eof", rounds_info, total_usage)
+                        base_response,
+                        final_output,
+                        _agent_usage(
+                            first_usage, total_usage, usage, flushed_final=False
+                        ),
+                        seq(),
+                        "upstream_eof",
+                        rounds_info,
+                        total_usage,
+                    )
                 )
                 return
 
@@ -519,13 +622,25 @@ async def fold_stream(
                 final_output.append(entry["item"])
 
             status = ((terminal or {}).get("response") or {}).get("status", "completed")
-            log.info("done: %d round(s) | %s | status=%s stop=%s",
-                     round_no, _fmt_usage(total_usage), status, stopped_reason or "natural")
+            log.info(
+                "done: %d round(s) | %s | status=%s stop=%s",
+                round_no,
+                _fmt_usage(total_usage),
+                status,
+                stopped_reason or "natural",
+            )
+            _record_chain(chain_store, base_response, orig_input, final_output)
             yield serialize_event(
                 _reconstruct_terminal(
-                    terminal, base_response, final_output,
+                    terminal,
+                    base_response,
+                    final_output,
                     _agent_usage(first_usage, total_usage, usage, flushed_final=True),
-                    seq(), rounds_info, stopped_reason, total_usage)
+                    seq(),
+                    rounds_info,
+                    stopped_reason,
+                    total_usage,
+                )
             )
             if saw_done:
                 yield serialize_done()
@@ -533,13 +648,22 @@ async def fold_stream(
 
     except (httpx.HTTPError, ConnectionError) as exc:
         log.warning("upstream error mid-stream (round %d): %r", round_no, exc)
-        log.info("done: %d round(s) | %s | status=incomplete stop=upstream_error",
-                 round_no, _fmt_usage(total_usage))
+        log.info(
+            "done: %d round(s) | %s | status=incomplete stop=upstream_error",
+            round_no,
+            _fmt_usage(total_usage),
+        )
+        _record_chain(chain_store, base_response, orig_input, final_output)
         yield serialize_event(
             _synthetic_incomplete(
-                base_response, final_output,
+                base_response,
+                final_output,
                 _agent_usage(first_usage, total_usage, None, flushed_final=False),
-                seq(), "upstream_error", rounds_info, total_usage)
+                seq(),
+                "upstream_error",
+                rounds_info,
+                total_usage,
+            )
         )
         return
     finally:

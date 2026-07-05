@@ -119,7 +119,9 @@ Codex（>= ~0.140，即 `responses_websockets` 特性）在回退到 HTTP 之前
 - `POST /v1/responses` —— 原有的 HTTP + SSE 传输方式。
 - `ws(s)://.../v1/responses` —— 按照官方文档的 [WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode) 线上协议：客户端发送 `{"type": "response.create", ...body...}`，本代理以独立的 `response.*` 事件帧作答（如果某一轮压根打不开，则回一个 `{"type": "error", ...}` 事件）。
 
-不管代理用的是哪种传输方式，内部每一轮仍然是向上游发起一次普通的 HTTP+SSE 请求，并走同一套续写折叠逻辑。这里没有维护一个常驻的上游 WebSocket 连接，也没有基于连接的 `previous_response_id` 缓存，所以它带来的收益是“不再有回退噪音”，而不是真正端到端 WebSocket 才能带来的额外延迟优势；折叠的正确性在两种传输方式下完全一致。
+不管代理用的是哪种传输方式，内部每一轮仍然是向上游发起一次普通的 HTTP+SSE 请求，并走同一套续写折叠逻辑。这里没有维护一个常驻的上游 WebSocket 连接，所以它带来的收益是“不再有回退噪音”，而不是真正端到端 WebSocket 才能带来的额外延迟优势；折叠的正确性在两种传输方式下完全一致。
+
+Codex（>= ~0.142）在这条传输链路上会用 `previous_response_id` 串联多轮请求——不管是工具调用循环里的下一步，还是后续的用户消息，都只发送新增的增量内容加上这个 id，默认上游会维持一个有状态的会话。但上游根本没法把它解析到本代理这种彼此无关、每轮都重新发起的 HTTP 请求上（会返回 `400 Unsupported parameter: previous_response_id`），所以代理自己维护了一个进程级缓存（response id -> 该轮结束时的完整 input），本地解析这条链：把缓存的历史拼接到增量内容前面，转发前始终丢弃 `previous_response_id`。如果缓存未命中（比如代理刚重启，或者条目超出了 TTL/容量被清理），会退化为只转发这次的增量内容，而不是直接让请求报错失败。
 
 如果想禁用 WebSocket 路由、强制只用 HTTP（例如排查传输层问题时），在 `config.toml` 的 `[server]` 下设置 `enable_websocket = false` 即可。
 
@@ -233,7 +235,7 @@ config.example.toml # 示例运行配置；复制为 config.toml 后本地使用
 - 非流式请求当前会透传，不进行折叠。
 - 截断检测器是针对已观察到的 `518 * n - 2` 指纹设计的。
 - 可选的 `repair_followup = "stateful"` 使用进程内内存状态；多代理实例之间不会共享。
-- WebSocket 路由每一轮仍然是桥接到一次普通的 HTTP+SSE 上游请求；它不维护常驻的上游 WebSocket 连接，也没有基于连接的 `previous_response_id` 缓存，因此带来的是“不再有回退噪音”，而不是真正端到端 WebSocket 模式所承诺的额外延迟优势。
+- WebSocket 路由每一轮仍然是桥接到一次普通的 HTTP+SSE 上游请求；它不维护常驻的上游 WebSocket 连接，因此带来的是“不再有回退噪音”，而不是真正端到端 WebSocket 模式所承诺的额外延迟优势。`previous_response_id` 串链是从一个进程级、带 TTL/容量上限的本地缓存解析的，而不是真正的上游会话；缓存未命中时（代理重启、条目过期）会只转发增量内容而不是完整历史。
 
 ## 致谢
 

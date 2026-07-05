@@ -5,6 +5,7 @@ not copied). The 518n-2 detector, the continuation-input shape, and the
 deterministic continue pair all live here so proxy.py stays focused on the
 streaming state machine.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +19,9 @@ ENCRYPTED_INCLUDE = "reasoning.encrypted_content"
 # --- 518*n - 2 truncation fingerprint ---------------------------------------
 
 
-def is_truncation_pattern(tokens: int | None, step: int = DEFAULT_TRUNCATION_STEP) -> bool:
+def is_truncation_pattern(
+    tokens: int | None, step: int = DEFAULT_TRUNCATION_STEP
+) -> bool:
     """True iff reasoning_tokens lands exactly on step*n - 2 (516, 1034, ...)."""
     return tokens is not None and tokens >= step - 2 and (tokens + 2) % step == 0
 
@@ -125,14 +128,17 @@ def build_round_payload(
     *,
     input_items: list[Any],
     force_include_encrypted: bool,
-    drop_previous_response_id: bool,
 ) -> dict[str, Any]:
     """Take the agent's request body and shape it for one upstream round.
 
     We never invent model/instructions/reasoning/tools — those are the agent's.
     We only: force stream=True (we always stream upstream), ensure encrypted
-    reasoning is in `include`, set the round's `input`, and (on continuation
-    rounds) drop `previous_response_id` since we carry state explicitly.
+    reasoning is in `include`, set the round's `input`, and always drop
+    `previous_response_id`. Every round this proxy opens upstream is a fresh,
+    unrelated HTTP request, so the real API never has a session to resolve
+    that id against (see `resolve_previous_response_id`, which must already
+    have spliced any chained history into `input_items` by the time this
+    runs).
     """
     body = dict(base_body)
     body["stream"] = True
@@ -141,9 +147,42 @@ def build_round_payload(
         body["include"] = merge_include(
             base_body.get("include"), force_encrypted=force_include_encrypted
         )
-    if drop_previous_response_id:
-        body.pop("previous_response_id", None)
+    body.pop("previous_response_id", None)
     return body
+
+
+def resolve_previous_response_id(
+    body: dict[str, Any], chain_store: Any
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Splice a client-supplied `previous_response_id` chain locally, and
+    always strip the field before the request goes anywhere near upstream.
+
+    This proxy never keeps a persistent upstream connection -- every round it
+    opens is a fresh, unrelated HTTP request -- so upstream has no session to
+    resolve `previous_response_id` against; it 400s with `Unsupported
+    parameter: previous_response_id`. Codex (>= ~0.142, chained
+    `responses_websockets` turns) relies on exactly that resolution to avoid
+    resending the whole transcript on every tool-loop step or follow-up turn,
+    so we resolve it ourselves from `chain_store` (id -> that turn's effective
+    full input, recorded by the fold loop) instead.
+
+    Returns `(new_body, previous_id, hit)`:
+    - `previous_id` is None when the request carried no `previous_response_id`
+      (`new_body is body` in that case -- nothing to do).
+    - `hit` is False on a cache miss (unknown/expired id, e.g. after a proxy
+      restart): `previous_response_id` is still dropped so the request doesn't
+      hard-fail, but `input` is left as the caller sent it -- best effort,
+      possibly missing earlier context.
+    """
+    prev_id = body.get("previous_response_id")
+    if not prev_id:
+        return body, None, False
+    cached = chain_store.get(prev_id) if chain_store is not None else None
+    new_body = {k: v for k, v in body.items() if k != "previous_response_id"}
+    if cached is not None:
+        new_body["input"] = [*cached, *(body.get("input") or [])]
+        return new_body, prev_id, True
+    return new_body, prev_id, False
 
 
 def declares_continue_tool(body: dict[str, Any], tool_name: str) -> bool:

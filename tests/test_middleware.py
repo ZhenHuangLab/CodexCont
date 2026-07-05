@@ -33,6 +33,7 @@ from middleware.codex import (
     is_truncation_pattern,
     reasoning_enabled,
     repair_followup_input,
+    resolve_previous_response_id,
     should_continue,
     tier_n,
 )
@@ -40,7 +41,7 @@ from middleware.config import load_config
 from middleware.creds import build_upstream_headers, would_inject_authorization
 from middleware.proxy import fold_stream
 from middleware.sse import DONE, incremental_sse
-from middleware.store import IdStore
+from middleware.store import ChainStore, IdStore
 
 # --- helpers ----------------------------------------------------------------
 
@@ -970,6 +971,64 @@ def test_reasoning_gate():
     )
 
 
+# --- previous_response_id local chain resolution ----------------------------
+# Every round this proxy opens upstream is a fresh, unrelated HTTP request, so
+# upstream can never resolve a client-supplied `previous_response_id` (it
+# 400s with `Unsupported parameter: previous_response_id`). Codex (>= ~0.142)
+# chains tool-loop steps and follow-up turns this way, so the proxy must
+# splice the cached history itself and always drop the field.
+
+
+def test_resolve_previous_response_id():
+    store = ChainStore()
+    store.set(
+        "resp_1",
+        [{"role": "user", "content": "hello"}, {"type": "message", "id": "m1"}],
+    )
+
+    # absent: untouched, same object, nothing reported
+    body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}]}
+    out, prev_id, hit = resolve_previous_response_id(body, store)
+    check("resolve: no-op when absent", out is body and prev_id is None and not hit)
+
+    # hit: cached items spliced ahead of the new input, id dropped
+    body2 = {
+        "model": "gpt-5.5",
+        "previous_response_id": "resp_1",
+        "input": [{"role": "user", "content": "follow-up"}],
+    }
+    out2, prev_id2, hit2 = resolve_previous_response_id(body2, store)
+    check("resolve: hit reports the id", prev_id2 == "resp_1" and hit2)
+    check(
+        "resolve: previous_response_id stripped on hit",
+        "previous_response_id" not in out2,
+    )
+    check(
+        "resolve: cached items spliced ahead of new input",
+        out2["input"]
+        == [
+            {"role": "user", "content": "hello"},
+            {"type": "message", "id": "m1"},
+            {"role": "user", "content": "follow-up"},
+        ],
+        str(out2["input"]),
+    )
+
+    # miss: id still stripped (never forwarded), input left as sent (best effort)
+    body3 = {
+        "model": "gpt-5.5",
+        "previous_response_id": "resp_missing",
+        "input": [{"role": "user", "content": "orphan"}],
+    }
+    out3, prev_id3, hit3 = resolve_previous_response_id(body3, store)
+    check("resolve: miss reports the id", prev_id3 == "resp_missing" and not hit3)
+    check(
+        "resolve: miss still strips previous_response_id",
+        "previous_response_id" not in out3,
+    )
+    check("resolve: miss keeps the caller's own input", out3["input"] == body3["input"])
+
+
 # --- 3-fix. stateful follow-up repair (#3) ----------------------------------
 
 
@@ -1260,6 +1319,60 @@ def test_ws_round1_error():
     )
 
 
+def test_ws_previous_response_id_chain():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    r1 = FakeResp(_round("rs_a", "ENC_A", 999, msg="turn1 done"))
+    r2 = FakeResp(_round("rs_b", "ENC_B", 999, msg="turn2 done"))
+    fake = FakeClient([r1, r2])
+
+    with TestClient(app) as client:
+        app.state.client = fake
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "input": [{"role": "user", "content": "turn-1-marker"}],
+                    }
+                )
+            )
+            evs1 = _ws_drain(ws)
+            resp_id = (evs1[-1].get("response") or {}).get("id") if evs1 else None
+
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "previous_response_id": resp_id,
+                        "input": [{"role": "user", "content": "turn-2-marker"}],
+                    }
+                )
+            )
+            evs2 = _ws_drain(ws)
+
+    check("chain: turn1 got a response id", bool(resp_id), str(resp_id))
+    check(
+        "chain: turn2 completes cleanly",
+        bool(evs2) and evs2[-1].get("type") == "response.completed",
+        str(evs2[-1] if evs2 else "no events"),
+    )
+    sent = fake.payloads[-1] if fake.payloads else {}
+    check(
+        "chain: previous_response_id dropped before upstream",
+        "previous_response_id" not in sent,
+        str(sent.get("previous_response_id", "<absent>")),
+    )
+    blob = json.dumps(sent.get("input"))
+    check(
+        "chain: turn-1 input spliced into turn-2 upstream payload",
+        "turn-1-marker" in blob and "turn-2-marker" in blob,
+        blob,
+    )
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -1279,11 +1392,13 @@ async def _main():
     test_auth_safety_guard()
     test_auth_injection()
     test_reasoning_gate()
+    test_resolve_previous_response_id()
     test_stateful_repair()
     await test_eof_incomplete()
     test_ws_fold_roundtrip()
     test_ws_passthrough()
     test_ws_round1_error()
+    test_ws_previous_response_id_chain()
 
 
 def main():

@@ -24,12 +24,13 @@ from .codex import (
     declares_continue_tool,
     reasoning_enabled,
     repair_followup_input,
+    resolve_previous_response_id,
 )
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .proxy import fold_stream, open_passthrough, open_round
 from .sse import DONE, incremental_sse
-from .store import IdStore
+from .store import ChainStore, IdStore
 
 log = logging.getLogger("middleware.app")
 
@@ -141,6 +142,24 @@ async def handle_responses(request: Request) -> Response:
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
 
+    # Every round this proxy opens upstream is a fresh, unrelated HTTP request
+    # (no persisted upstream connection/session), so a client-supplied
+    # `previous_response_id` can never resolve there -- splice any chained
+    # history we have cached locally and always drop the field before it goes
+    # anywhere near upstream (fold path AND passthrough alike).
+    body, prev_id, chain_hit = resolve_previous_response_id(
+        body, request.app.state.chain_store
+    )
+    if prev_id:
+        log.info(
+            "previous_response_id=%s %s",
+            prev_id,
+            "resolved from local cache"
+            if chain_hit
+            else "MISS -- dropping (context may be incomplete)",
+        )
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
     url = _resolve_upstream_url(cfg, request)
     if url is None:
         return JSONResponse(
@@ -211,7 +230,6 @@ async def handle_responses(request: Request) -> Response:
         body,
         input_items=list(body.get("input") or []),
         force_include_encrypted=cfg.stream.force_include_encrypted,
-        drop_previous_response_id=False,  # round 1 passes it through
     )
 
     # Open round 1 here so a non-2xx (e.g. bad auth) is mirrored with its real
@@ -228,7 +246,14 @@ async def handle_responses(request: Request) -> Response:
 
     return StreamingResponse(
         fold_stream(
-            client, cfg, body, headers, resp, request.app.state.id_store, url=url
+            client,
+            cfg,
+            body,
+            headers,
+            resp,
+            request.app.state.id_store,
+            url=url,
+            chain_store=request.app.state.chain_store,
         ),
         media_type="text/event-stream",
     )
@@ -246,9 +271,15 @@ async def handle_responses(request: Request) -> Response:
 # https://developers.openai.com/api/docs/guides/websocket-mode -- but
 # internally still open one plain HTTP+SSE round per turn upstream, reusing
 # the exact same fold/passthrough logic as the POST route. There is no
-# persistent upstream WebSocket or connection-local `previous_response_id`
-# cache, so this buys "no fallback noise", not the extra latency win a true
-# end-to-end WebSocket bridge would.
+# persistent upstream WebSocket connection, so this buys "no fallback noise",
+# not the extra latency win a true end-to-end WebSocket bridge would. Codex
+# (>= ~0.142) chains turns with `previous_response_id` assuming exactly such a
+# persistent session (tool-loop steps and follow-up messages alike send only
+# the new delta + that id); since upstream can never resolve it against one of
+# our disconnected per-round requests (400 `Unsupported parameter:
+# previous_response_id`), we resolve it ourselves from a process-wide
+# `ChainStore` (response id -> that turn's effective full input) shared by
+# both transports -- see `codex.resolve_previous_response_id`.
 
 
 def _ws_error_event(
@@ -312,12 +343,23 @@ async def _handle_response_create(
     cfg: Config,
     client: httpx.AsyncClient,
     id_store: Any,
+    chain_store: Any,
     body: dict[str, Any],
     headers: dict[str, str],
     url: str,
 ) -> None:
     """Run one `response.create` turn to completion, relaying `response.*` (or
     a single `error`) event as individual WebSocket JSON text frames."""
+    body, prev_id, chain_hit = resolve_previous_response_id(body, chain_store)
+    if prev_id:
+        log.info(
+            "ws previous_response_id=%s %s",
+            prev_id,
+            "resolved from local cache"
+            if chain_hit
+            else "MISS -- dropping (context may be incomplete)",
+        )
+
     should_fold, why = _fold_decision(cfg, body)
     log.info(
         "ws %s: model=%s url=%s input_items=%d",
@@ -337,7 +379,16 @@ async def _handle_response_create(
             )
             return
         event_source = _events_from_byte_stream(
-            fold_stream(client, cfg, body, headers, resp, id_store, url=url)
+            fold_stream(
+                client,
+                cfg,
+                body,
+                headers,
+                resp,
+                id_store,
+                url=url,
+                chain_store=chain_store,
+            )
         )
     else:
         event_source = _ws_open_events(client, url, body, headers)
@@ -354,6 +405,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     cfg: Config = websocket.app.state.cfg
     client: httpx.AsyncClient = websocket.app.state.client
     id_store = websocket.app.state.id_store
+    chain_store = websocket.app.state.chain_store
 
     url = _resolve_upstream_url(cfg, websocket)
     if url is None:
@@ -399,7 +451,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
 
             try:
                 await _handle_response_create(
-                    websocket, cfg, client, id_store, body, headers, url
+                    websocket, cfg, client, id_store, chain_store, body, headers, url
                 )
             except (httpx.HTTPError, ConnectionError) as exc:
                 log.warning("ws: round failed to open: %r", exc)
@@ -465,6 +517,7 @@ def create_app(cfg: Config) -> Starlette:
         app.state.cfg = cfg
         app.state.client = _make_client()
         app.state.id_store = IdStore()
+        app.state.chain_store = ChainStore()
         try:
             yield
         finally:

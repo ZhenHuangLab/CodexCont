@@ -126,7 +126,9 @@ Codex (>= ~0.140, the `responses_websockets` feature) tries a WebSocket upgrade 
 - `POST /v1/responses` -- the original HTTP + SSE transport.
 - `ws(s)://.../v1/responses` -- speaks the documented [WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode) wire shape: the agent sends `{"type": "response.create", ...body...}`, the proxy answers with individual `response.*` event frames (or one `{"type": "error", ...}` frame if a round can't be opened at all).
 
-Internally, every turn -- regardless of which transport the agent used -- still opens one plain HTTP+SSE round upstream and runs it through the identical continuation-folding logic. There is no persistent upstream WebSocket connection and no connection-local `previous_response_id` cache, so this buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket bridge would; folding correctness is identical either way.
+Internally, every turn -- regardless of which transport the agent used -- still opens one plain HTTP+SSE round upstream and runs it through the identical continuation-folding logic. There is no persistent upstream WebSocket connection, so this buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket bridge would; folding correctness is identical either way.
+
+Codex (>= ~0.142) chains turns on this transport with `previous_response_id` -- both tool-loop steps and later user turns send only the new delta plus that id, assuming a persistent, stateful session. Upstream can never resolve it against one of this proxy's disconnected per-round requests (`400 Unsupported parameter: previous_response_id`), so the proxy keeps a small process-wide cache (response id -> that turn's effective full input) and resolves the chain locally: it splices the cached history in front of the delta and always drops `previous_response_id` before forwarding. A cache miss (e.g. right after a proxy restart, or the id fell out of the TTL/size-bounded cache) degrades to forwarding just the delta rather than failing the request outright.
 
 Set `enable_websocket = false` under `[server]` in `config.toml` to disable the WebSocket route and force HTTP-only (e.g. while debugging transport issues).
 
@@ -240,7 +242,7 @@ config.example.toml # example runtime configuration; copy to config.toml for loc
 - Non-streaming requests are currently passed through rather than folded.
 - The truncation detector is intentionally specific to the observed `518 * n - 2` fingerprint.
 - Optional `repair_followup = "stateful"` uses in-memory process-local state; it is not shared across multiple proxy instances.
-- The WebSocket route bridges to a plain HTTP+SSE upstream round per turn; it keeps no persistent upstream WebSocket connection and no connection-local `previous_response_id` cache, so it buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket mode promises.
+- The WebSocket route bridges to a plain HTTP+SSE upstream round per turn; it keeps no persistent upstream WebSocket connection, so it buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket mode promises. `previous_response_id` chaining is resolved from a process-wide, TTL/size-bounded local cache rather than a real upstream session -- a cache miss (proxy restart, expired entry) forwards just the delta input instead of the full history.
 
 ## Acknowledgements
 
