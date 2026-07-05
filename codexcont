@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# One-click entrypoint for CodexCont's installer/service-manager CLI.
+#
+#   ./codexcont              interactive menu
+#   ./codexcont install      guided setup (deps + config.toml), asks before doing anything
+#   ./codexcont start        start the proxy in the background
+#   ./codexcont logs -f      follow the log
+#   ./codexcont stop         stop it
+#
+# Prefers `uv` (auto-syncs dependencies on every run) and falls back to a
+# plain `python3 -m middleware.cli` (Method B in INSTALL-GUIDE-AGENT/AGENT.md)
+# when uv isn't installed. Equivalent one-off/no-clone alternative:
+#   uvx --from <path-or-git-url-to-this-repo> codexcont
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+if command -v uv >/dev/null 2>&1; then
+  exec uv run python -m middleware.cli "$@"
+fi
+
+PY="python3"
+command -v python3 >/dev/null 2>&1 || PY="python"
+exec "$PY" -m middleware.cli "$@"

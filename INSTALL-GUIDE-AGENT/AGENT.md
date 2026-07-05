@@ -84,13 +84,14 @@ and can confuse later diagnosis if you don't know about them upfront:
 
 ```bash
 ls -la ~/.codexcont-backup/ 2>/dev/null              # old backups not cleaned up?
-grep -n "^model_provider\|\[model_providers\." ~/.codex/config.toml 2>/dev/null   # stray provider block already present?
+grep -n "^openai_base_url\|^model_provider\|\[model_providers\." ~/.codex/config.toml 2>/dev/null  # stray wiring already present?
 lsof -i :8787                                         # default port already occupied?
 ```
 
 If any of these show something, **tell the user what you found** before proceeding — don't
-silently assume a clean environment. A pre-existing `[model_providers.codexcont]` block
-should be normalized/reused in §5 rather than duplicated.
+silently assume a clean environment. A pre-existing top-level `openai_base_url` or
+`[model_providers.codexcont]` block should be normalized/reused in §7a rather than
+duplicated.
 
 ---
 
@@ -178,6 +179,12 @@ backup lives. Only now may you edit agent configs.
 ---
 
 ## §4 — Install CodexCont (two methods)
+
+> **Shortcut:** `./codexcont install` (or `uv run codexcont install`) automates this section
+> plus §5–§6 interactively — it shows what it's about to do and asks for confirmation before
+> touching anything. It's fine to drive it directly instead of the manual steps below; the
+> rest of this section is what it does under the hood (useful if it isn't available, or you
+> want full control over each step).
 
 Offer the user the method that matches §2. **Method A is recommended.**
 
@@ -279,7 +286,12 @@ lsof -i :8787            # confirm it's empty before restarting
 ```
 
 Start the server (it must keep running — see §8). If §5 determined the user needs a proxy to
-reach OpenAI, export it in this same shell/process before starting (see also §8's shortcut):
+reach OpenAI, export it in this same shell/process before starting (see also §8's shortcut).
+
+> **If you (the agent) already ran `codexcont install`,** prefer `./codexcont start` here: it
+> backgrounds the process for you (with the outbound-proxy env from §5 applied automatically
+> if configured), so you don't need a second concurrent shell just to run the `curl` check
+> below — `./codexcont logs` shows what happened afterward. Otherwise, run it directly:
 
 ```bash
 # only if needed (see §5):
@@ -328,12 +340,6 @@ append `/responses` themselves, matching the proxy's listen path `/v1/responses`
 > enough. Do this before attempting §7c verification, or you'll be debugging a config that
 > isn't actually loaded yet.
 
-> **⚠️ Switching Codex's `model_provider` hides the user's existing conversation history.**
-> Past sessions are grouped per provider, so they stop appearing under a different one — they
-> are **hidden, not deleted** (restoring the original provider in §10 brings the history view
-> back). **Choose the path below by how the user reaches their model today**, to avoid this
-> when possible.
-
 **Case 1 — the user already uses a custom provider** (`model_provider` points at a
 `[model_providers.<id>]` with a third-party `base_url`):
 
@@ -357,10 +363,33 @@ mode = "fixed"
 
 Record the original `base_url` in `RESTORE.md` (§3.5).
 
-**Case 2 — the user is on official ChatGPT OAuth login (built-in provider):**
+**Case 2 — the user is on official ChatGPT OAuth login (built-in provider), preferred method:**
 
-Codex's built-in `openai` provider **cannot** be overridden via `[model_providers.openai]`,
-so you must define a **new** provider and switch to it:
+Set the **top-level** `openai_base_url` key — it overrides only the built-in `openai`
+provider's base URL, in place. Do **not** touch `model_provider` or add a
+`[model_providers.*]` block: the provider id stays `openai`, so **session history, remote
+compaction, and remote-control all keep working exactly as before.**
+
+```toml
+# ~/.codex/config.toml — at the TOP LEVEL of the file, before any [section]:
+openai_base_url = "http://127.0.0.1:8787/v1"
+```
+
+That's the entire change for this case — no `wire_api`, no new provider, no `model_provider`
+switch. Keep the proxy's own `[upstream]` on the default ChatGPT Codex backend; Codex's OAuth
+auth is forwarded by proxy `passthrough`. `codexcont wire-codex` automates exactly this edit
+(with an automatic backup); `codexcont unwire-codex` removes it later.
+
+`openai_base_url` was added upstream in `openai/codex` PR #12031 (merged 2026-03-14),
+replacing the older, now-deprecated `OPENAI_BASE_URL` env var. It requires a reasonably
+current Codex CLI and **only takes effect in the user-level `~/.codex/config.toml`** — Codex's
+own docs state it is ignored inside a project-local `.codex/config.toml`. If §7c verification
+shows Codex never reaching the proxy despite this key being set correctly, the CLI is
+probably too old; fall back to the **Case 2 (legacy)** method below.
+
+**Case 2 (legacy) — only if `openai_base_url` has no effect (old Codex CLI):**
+
+Define a new provider and switch to it:
 
 ```toml
 [model_providers.codexcont]
@@ -374,14 +403,14 @@ model = "gpt-5.5"               # or whatever model the user runs
 ```
 
 🛑 **Before making this switch, explicitly tell the user it will hide their existing Codex
-conversation history** (hidden, not deleted; the §10 restore brings it back). Proceed only
-with their OK. Keep the proxy `[upstream]` on the default ChatGPT Codex backend — Codex's
-OAuth auth is forwarded by proxy `passthrough`.
+conversation history.** Past sessions are grouped per provider, so they stop appearing under
+a different one — they are **hidden, not deleted** (restoring the original provider in §10
+brings the history view back). Proceed only with their OK. Keep the proxy `[upstream]` on the
+default ChatGPT Codex backend.
 
-**Common notes (both cases):**
+**Common notes (all cases):**
 
-- Provider config must live in the **user-level** `~/.codex/config.toml`, not a project-local
-  one.
+- These keys must live in the **user-level** `~/.codex/config.toml`, not a project-local one.
 - In proxy `passthrough` mode, Codex's own login (OAuth `auth.json`, or its API key) is
   forwarded upstream unchanged — don't put a token in the provider block for the OAuth case.
 - A relay that needs its key check loosened may require `requires_openai_auth = true` in its
@@ -422,7 +451,7 @@ A reachable port is not proof it works. Run a **real prompt** through the wired 
 confirm the proxy actually folded a round:
 
 - Watch the proxy's stdout (log level `info`) while the agent answers a non-trivial,
-  reasoning-heavy prompt.
+  reasoning-heavy prompt — or, if it's running via `codexcont start`, `./codexcont logs -f`.
 - The final response's metadata should include **`metadata.proxy_rounds`** (per-round
   reasoning token counts and detected tier `n`) when continuation fired. For deeper proof,
   set `[log].dump_rounds_dir` in `config.toml` and inspect the per-round SSE dumps.
@@ -431,11 +460,11 @@ If the agent works but `proxy_rounds` never appears, continuation simply wasn't 
 for that prompt (it only fires on the truncation fingerprint) — that's fine. If the agent
 errors, see §9.
 
-**Ignore `GET /v1/models` 404s — this is expected noise.** Some clients (Codex included)
-periodically poll `GET /v1/models` to list models; CodexCont only implements
-`POST /v1/responses`, so this route is always 404. It is unrelated to whether real chat
-requests work. Judge success only by `POST /v1/responses` status codes and the
-`middleware.proxy:` round logs described above.
+**A `GET /v1/models` 404 is no longer expected.** Some clients (Codex included) periodically
+poll `GET /v1/models` to list models; CodexCont now answers it with a minimal placeholder
+list (see `[models]` in `config.toml`) so this is a real `200`. A `404` there today would mean
+an old CodexCont checkout — update it. Either way, judge real functionality only by
+`POST /v1/responses` status codes and the `middleware.proxy:` round logs described above.
 
 > **🛑 If the client reports a `404` on `/v1/responses` but the proxy's own log shows no
 > record of that request at all**, do not assume CodexCont is broken — the most likely cause
@@ -474,40 +503,44 @@ requests work. Judge success only by `POST /v1/responses` status codes and the
 ## §8 — Keep it running + optional shortcut
 
 **Tell the user clearly:** CodexCont must **stay running** the whole time they use their
-agent through it. If they close the terminal/process, the agent loses its upstream and will
-error until the proxy is started again.
+agent through it. If it stops, the agent loses its upstream and will error until the proxy is
+started again.
 
-Then **ask** whether they want a convenient way to start it (e.g. a Desktop shortcut). If
-yes, create one appropriate to the OS and to how they installed it (Method A vs B). Examples
-— adapt paths to the real repo location:
+**Recommended: the bundled CLI.** `./codexcont start` (or `uv run codexcont start`) launches
+CodexCont detached in the background and returns immediately; `./codexcont logs -f` tails its
+output; `./codexcont stop` stops it; `./codexcont status` reports whether it's up. This
+already satisfies "stays running without holding a terminal open" on macOS/Linux/Windows
+alike — prefer it over a hand-rolled shortcut unless the user specifically wants CodexCont to
+**auto-start at login/boot**, or wants the outbound-proxy env vars from §5 handled for them
+(the CLI's `install` wizard asks about this and applies it on every `start` automatically).
 
-- **Windows** — a `start-codexcont.bat` on the Desktop:
+If the user wants an auto-start-at-login shortcut, **ask** first, then create one appropriate
+to the OS. Examples — adapt paths to the real repo location:
+
+- **Windows** — a `start-codexcont.bat` on the Desktop, or in `shell:startup` to run at login:
   ```bat
   @echo off
-  cd /d "C:\path\to\gptpoc"
-  uv run python run.py
-  pause
+  cd /d "C:\path\to\CodexCont"
+  codexcont.bat start
   ```
-  (Optionally create a `.lnk` shortcut to it.)
-- **macOS** — a `start-codexcont.command` (then `chmod +x` it) on the Desktop:
+- **macOS** — a `start-codexcont.command` (then `chmod +x` it) on the Desktop, or a
+  `~/Library/LaunchAgents/*.plist` to run at login:
   ```bash
   #!/bin/bash
-  # Uncomment and adjust if the user's network needs a proxy to reach OpenAI (see §5/§6):
-  # export http_proxy="http://127.0.0.1:<their-proxy-port>"
-  # export https_proxy="http://127.0.0.1:<their-proxy-port>"
-  # export no_proxy="127.0.0.1,localhost,::1"
-  cd "/path/to/gptpoc" && uv run python run.py
+  cd "/path/to/CodexCont" && ./codexcont start
   ```
-- **Linux** — a `~/.local/share/applications/codexcont.desktop` or a shell script:
+- **Linux** — a `~/.local/share/applications/codexcont.desktop`, or a systemd **user** unit to
+  run at login:
   ```ini
   [Desktop Entry]
   Type=Application
   Name=CodexCont
-  Exec=/bin/bash -lc 'cd /path/to/gptpoc && uv run python run.py'
-  Terminal=true
+  Exec=/bin/bash -lc 'cd /path/to/CodexCont && ./codexcont start'
+  Terminal=false
   ```
 
-For Method B, replace `uv run python run.py` with `python run.py`. Record any shortcut you
+All three call the CLI's background mode, so the shortcut itself returns right away; use
+`codexcont logs -f` / `codexcont status` / `codexcont stop` afterward. Record any shortcut you
 create in the `RESTORE.md` manifest from §3.5 so it can be removed on uninstall.
 
 ---
@@ -527,7 +560,8 @@ create in the `RESTORE.md` manifest from §3.5 so it can be removed on uninstall
 | Higher first-token latency on final answer | Expected — final text is buffered until the round proves it wasn't truncated | Not a bug; document to the user. |
 | Your own `curl` verification (§6) gets `403`/refused, but only when *you* (the agent) run it | Your shell is itself network-sandboxed and blocks the proxy's outbound call to `chatgpt.com` | Re-run the verification with full/unrestricted network access for your own shell; a numeric status code then confirms the proxy is fine. |
 | Real client gets `404` on `/v1/responses`, but the proxy's own log has **no record** of that request | A local system proxy tool (Clash/mihomo/Surge) is intercepting loopback traffic instead of routing it `DIRECT`, and returning its own 404 | See the boxed guidance in §7c: add a `127.0.0.0/8 DIRECT` rule / bypass entry in the proxy tool, or set `NO_PROXY` + fully relaunch the client. Do not touch CodexCont. |
-| Client periodically logs `GET /v1/models` → 404 | Expected polling noise; CodexCont doesn't implement this route | Ignore; judge health via `POST /v1/responses` instead (§7c). |
+| Client periodically logs `GET /v1/models` → 404 | Old CodexCont checkout — current versions answer this with a placeholder 200 list | Update CodexCont; judge health via `POST /v1/responses` either way (§7c). |
+| `openai_base_url` set correctly but Codex still hits the real API | Codex CLI predates PR #12031, or the key was set in a project-local `.codex/config.toml` (ignored there) | Move the key to the user-level `~/.codex/config.toml`, or upgrade Codex; else use the §7a Case 2 (legacy) `[model_providers.codexcont]` method. |
 | CodexCont can't reach `chatgpt.com`/OpenAI at all (proxy up, but every upstream call fails/times out) | The user's network needs a proxy, but the process running `run.py` has no `http_proxy`/`https_proxy` env set (CodexCont doesn't read macOS system proxy settings) | Export `http_proxy`/`https_proxy` in the same shell/script that starts `run.py` (see §5/§6/§8). |
 | Config edits to `~/.codex/config.toml` don't seem to take effect | Codex only reads config at startup | Have the user fully quit and relaunch Codex (not just close the window). |
 
@@ -537,17 +571,21 @@ create in the `RESTORE.md` manifest from §3.5 so it can be removed on uninstall
 
 When the user asks to remove CodexCont:
 
-1. **Stop the proxy** (kill the `run.py` process / close its terminal).
-2. **Restore agent configs** from the backup made in §3.5: open `$BACKUP/RESTORE.md`, then
-   copy each backed-up file back over its original path. For example:
-   ```bash
-   cp -p "$BACKUP/codex.config.toml" "$HOME/.codex/config.toml"
-   cp -p "$BACKUP/pi.models.json"    "$HOME/.pi/agent/models.json"
-   ```
-   (If you instead only added a provider block, you may surgically remove just that block —
-   but restoring the backup is the safe default.)
+1. **Stop the proxy** (`codexcont stop`, or kill the `run.py` process / close its terminal).
+2. **Undo each agent's wiring**, per what was actually done in §7:
+   - Codex via §7a Case 2 (`openai_base_url`): run `codexcont unwire-codex`.
+   - Any other edit (Case 1, Case 2 legacy, or Pi): restore from the backup made in §3.5 —
+     open `$BACKUP/RESTORE.md`, then copy each backed-up file back over its original path.
+     For example:
+     ```bash
+     cp -p "$BACKUP/codex.config.toml" "$HOME/.codex/config.toml"
+     cp -p "$BACKUP/pi.models.json"    "$HOME/.pi/agent/models.json"
+     ```
+     (If you instead only added a provider block, you may surgically remove just that block —
+     but restoring the backup is the safe default.)
 3. **Remove the shortcut** you created in §8, if any.
-4. **Optionally remove the project artifacts**: `.venv/` and `config.toml` (or, for Method B,
-   `python -m pip uninstall httpx starlette uvicorn` only if the user wants those gone).
+4. **Optionally remove the project artifacts**: `.venv/`, `.codexcont/`, and `config.toml`
+   (or, for Method B, `python -m pip uninstall httpx starlette uvicorn` only if the user
+   wants those gone).
 5. Confirm to the user, in their language, that their original agent configuration is
    restored, and verify their agent works against its original upstream again.

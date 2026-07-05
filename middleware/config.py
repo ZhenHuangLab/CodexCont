@@ -3,6 +3,7 @@
 One central config controls everything. Missing keys fall back to the defaults
 baked in here, so a partial (or absent) config.toml still works.
 """
+
 from __future__ import annotations
 
 import tomllib
@@ -35,9 +36,13 @@ class UpstreamCfg:
 
 @dataclass(frozen=True)
 class AuthCfg:
-    mode: str = "passthrough_then_inject"  # passthrough | inject | passthrough_then_inject
+    mode: str = (
+        "passthrough_then_inject"  # passthrough | inject | passthrough_then_inject
+    )
     access_token: str = ""  # injected as `Authorization: Bearer <access_token>`
-    chatgpt_account_id: str = ""  # injected as `chatgpt-account-id` (Codex only; empty = omit header)
+    chatgpt_account_id: str = (
+        ""  # injected as `chatgpt-account-id` (Codex only; empty = omit header)
+    )
 
 
 @dataclass(frozen=True)
@@ -47,15 +52,35 @@ class ContinueCfg:
     max_continue: int = 8  # hard round cap after round 1 (primary runaway guard)
     min_n: int = 1  # continue only when truncation tier n >= min_n
     max_n: int = 0  # 0 = no cap; else stop forcing once n > max_n
-    method: str = "commentary"  # continuation provocation: "commentary" (default) | "tool_pair"
+    method: str = (
+        "commentary"  # continuation provocation: "commentary" (default) | "tool_pair"
+    )
     marker_text: str = "Continue thinking..."  # commentary path: assistant message text
-    forward_marker: bool = False  # commentary path: emit the marker downstream so the agent
+    forward_marker: bool = (
+        False  # commentary path: emit the marker downstream so the agent
+    )
     # echoes it back next turn (cross-turn structure + prompt-cache); false = hidden/clean.
     # --- tool_pair path only (legacy; used when method = "tool_pair") ---
-    continue_tool_name: str = "continue_thinking"  # synthetic tool name + collision-bypass name
-    continue_output_text: str = "Please continue thinking about the query."  # function_call_output
-    repair_followup: str = "off"  # tool_pair cross-turn: "off" | "stateful" (id-keyed re-insert)
+    continue_tool_name: str = (
+        "continue_thinking"  # synthetic tool name + collision-bypass name
+    )
+    continue_output_text: str = (
+        "Please continue thinking about the query."  # function_call_output
+    )
+    repair_followup: str = (
+        "off"  # tool_pair cross-turn: "off" | "stateful" (id-keyed re-insert)
+    )
     max_total_output_tokens: int = 0  # optional cumulative cap (0 = off)
+
+
+@dataclass(frozen=True)
+class ModelsCfg:
+    # Advertised at GET /v1/models and GET /v1/models/{id}. Cosmetic only: a
+    # real POST /v1/responses request forwards whatever `model` the caller
+    # sends, regardless of this list. This just gives clients that poll
+    # GET /v1/models (Codex included) a real 200 instead of a 404.
+    ids: tuple[str, ...] = ("gpt-5.5", "gpt-5.4-mini", "gpt-5.4", "gpt-5.3-codex")
+    owned_by: str = "codexcont"
 
 
 @dataclass(frozen=True)
@@ -77,6 +102,7 @@ class Config:
     upstream: UpstreamCfg = field(default_factory=UpstreamCfg)
     auth: AuthCfg = field(default_factory=AuthCfg)
     cont: ContinueCfg = field(default_factory=ContinueCfg)
+    models: ModelsCfg = field(default_factory=ModelsCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
     log: LogCfg = field(default_factory=LogCfg)
     # Directory config.toml lived in (for resolving relative paths if needed).
@@ -106,12 +132,15 @@ def load_config(path: str | Path) -> Config:
     upstream = _section(data, "upstream")
     auth = _section(data, "auth")
     cont = _section(data, "continue")
+    models = _section(data, "models")
     stream = _section(data, "stream")
     log = _section(data, "log")
 
-    # listen_paths is a list in TOML; store as tuple.
+    # listen_paths / models.ids are lists in TOML; store as tuples.
     if "listen_paths" in server and isinstance(server["listen_paths"], list):
         server = {**server, "listen_paths": tuple(server["listen_paths"])}
+    if "ids" in models and isinstance(models["ids"], list):
+        models = {**models, "ids": tuple(str(x) for x in models["ids"])}
 
     # [upstream.headers] is a nested table under [upstream].
     up_headers = upstream.get("headers") or {}
@@ -123,6 +152,7 @@ def load_config(path: str | Path) -> Config:
         upstream=UpstreamCfg(**_only_known(UpstreamCfg, upstream)),
         auth=AuthCfg(**_only_known(AuthCfg, auth)),
         cont=ContinueCfg(**_only_known(ContinueCfg, cont)),
+        models=ModelsCfg(**_only_known(ModelsCfg, models)),
         stream=StreamCfg(**_only_known(StreamCfg, stream)),
         log=LogCfg(**_only_known(LogCfg, log)),
         root=path.resolve().parent if path.exists() else Path.cwd(),

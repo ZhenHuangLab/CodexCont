@@ -4,6 +4,7 @@ Only ACTS when continuation is enabled and the agent did not itself declare a
 `continue_thinking` tool (collision rule). Otherwise it is a pure passthrough,
 so it is safe in front of all traffic.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -68,7 +69,10 @@ def _resolve_upstream_url(cfg: Config, request: Request) -> str | None:
 
 
 def _url_is_from_header(cfg: Config, request: Request) -> bool:
-    return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
+    return (
+        cfg.upstream.mode in ("header", "header_required")
+        and _header_base(request) is not None
+    )
 
 
 async def _passthrough(
@@ -107,7 +111,9 @@ async def handle_responses(request: Request) -> Response:
     url = _resolve_upstream_url(cfg, request)
     if url is None:
         return JSONResponse(
-            {"error": "Responses-API-Base header is required (upstream mode=header_required)"},
+            {
+                "error": "Responses-API-Base header is required (upstream mode=header_required)"
+            },
             status_code=400,
         )
 
@@ -117,12 +123,16 @@ async def handle_responses(request: Request) -> Response:
     if _url_is_from_header(cfg, request) and would_inject_authorization(
         cfg, agent_has_authorization=request.headers.get("authorization") is not None
     ):
-        log.warning("blocked: Responses-API-Base override without own auth (model=%s)",
-                    body.get("model"))
+        log.warning(
+            "blocked: Responses-API-Base override without own auth (model=%s)",
+            body.get("model"),
+        )
         return JSONResponse(
-            {"error": "When overriding the upstream base (Responses-API-Base), the request must "
-                      "provide its own Authorization; the proxy will not send its configured "
-                      "credentials to an externally supplied URL."},
+            {
+                "error": "When overriding the upstream base (Responses-API-Base), the request must "
+                "provide its own Authorization; the proxy will not send its configured "
+                "credentials to an externally supplied URL."
+            },
             status_code=400,
         )
 
@@ -131,9 +141,8 @@ async def handle_responses(request: Request) -> Response:
     # the agent declaring its own continue_thinking) is a pure passthrough.
     # The collision rule only matters for the tool_pair method (we inject a tool);
     # commentary injects no tool, so a declared continue_thinking is irrelevant.
-    collision = (
-        cfg.cont.method == "tool_pair"
-        and declares_continue_tool(body, cfg.cont.continue_tool_name)
+    collision = cfg.cont.method == "tool_pair" and declares_continue_tool(
+        body, cfg.cont.continue_tool_name
     )
     should_fold = (
         cfg.cont.enabled
@@ -142,16 +151,31 @@ async def handle_responses(request: Request) -> Response:
         and not collision
     )
     if not should_fold:
-        why = ("disabled" if not cfg.cont.enabled
-               else "non-stream" if not body.get("stream")
-               else "non-reasoning" if not reasoning_enabled(body)
-               else "declares-continue_thinking")
-        log.info("passthrough (%s): model=%s path=%s url=%s",
-                 why, body.get("model"), request.url.path, url)
+        why = (
+            "disabled"
+            if not cfg.cont.enabled
+            else "non-stream"
+            if not body.get("stream")
+            else "non-reasoning"
+            if not reasoning_enabled(body)
+            else "declares-continue_thinking"
+        )
+        log.info(
+            "passthrough (%s): model=%s path=%s url=%s",
+            why,
+            body.get("model"),
+            request.url.path,
+            url,
+        )
         return await _passthrough(client, cfg, request, raw, url)
 
-    log.info("fold start: model=%s path=%s url=%s input_items=%d",
-             body.get("model"), request.url.path, url, len(body.get("input") or []))
+    log.info(
+        "fold start: model=%s path=%s url=%s input_items=%d",
+        body.get("model"),
+        request.url.path,
+        url,
+        len(body.get("input") or []),
+    )
 
     # repair_followup="stateful": re-insert tool_pair continue pairs after recorded
     # ids (tool_pair only — commentary preserves cross-turn structure via forward_marker).
@@ -181,13 +205,52 @@ async def handle_responses(request: Request) -> Response:
         err = await resp.aread()
         await resp.aclose()
         return Response(
-            err, status_code=resp.status_code, media_type=resp.headers.get("content-type")
+            err,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type"),
         )
 
     return StreamingResponse(
-        fold_stream(client, cfg, body, headers, resp, request.app.state.id_store, url=url),
+        fold_stream(
+            client, cfg, body, headers, resp, request.app.state.id_store, url=url
+        ),
         media_type="text/event-stream",
     )
+
+
+def _model_object(model_id: str, owned_by: str) -> dict[str, Any]:
+    return {"id": model_id, "object": "model", "created": 0, "owned_by": owned_by}
+
+
+async def handle_models(request: Request) -> Response:
+    """GET /v1/models -- a minimal OpenAI-compatible model list.
+
+    Several clients (Codex included) periodically poll this endpoint, e.g. to
+    populate a model picker. CodexCont used to only implement POST
+    /v1/responses, so this always 404'd -- harmless, but noisy in logs. The
+    advertised ids are purely cosmetic: CodexCont does not restrict which
+    model a real request may use, it forwards whatever `model` the caller
+    sends. Configure the advertised list via `[models]` in config.toml.
+    """
+    cfg: Config = request.app.state.cfg
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": [_model_object(mid, cfg.models.owned_by) for mid in cfg.models.ids],
+        }
+    )
+
+
+async def handle_model(request: Request) -> Response:
+    """GET /v1/models/{model_id} -- always reports the requested id as
+    available, for the same cosmetic reason as handle_models above."""
+    cfg: Config = request.app.state.cfg
+    model_id = request.path_params["model_id"]
+    return JSONResponse(_model_object(model_id, cfg.models.owned_by))
+
+
+async def handle_health(_request: Request) -> Response:
+    return JSONResponse({"status": "ok", "service": "codexcont"})
 
 
 def _make_client() -> httpx.AsyncClient:
@@ -213,6 +276,12 @@ def create_app(cfg: Config) -> Starlette:
             await app.state.client.aclose()
 
     routes = [
-        Route(path, handle_responses, methods=["POST"]) for path in cfg.server.listen_paths
+        Route(path, handle_responses, methods=["POST"])
+        for path in cfg.server.listen_paths
+    ]
+    routes += [
+        Route("/v1/models", handle_models, methods=["GET"]),
+        Route("/v1/models/{model_id:path}", handle_model, methods=["GET"]),
+        Route("/health", handle_health, methods=["GET"]),
     ]
     return Starlette(routes=routes, lifespan=lifespan)

@@ -23,6 +23,7 @@ This project explicitly bypasses the observed OpenAI Codex reasoning-truncation 
 - If the round is truncated, discards the tentative output and opens a continuation round with the prior reasoning replayed.
 - If the round finishes cleanly or a safety cap is reached, flushes the final round output and emits one reconstructed terminal response.
 - Leaves non-matching traffic as a transparent passthrough.
+- Answers `GET /v1/models` (and `/v1/models/{id}`, `/health`) with a minimal placeholder list instead of 404, since several clients (Codex included) poll it.
 
 The default continuation method is a hidden `phase: "commentary"` assistant message (`"Continue thinking..."`). A legacy synthetic tool-pair mode is also available.
 
@@ -57,6 +58,32 @@ You can also run with the already-created virtual environment directly:
 # Windows / Git Bash in this workspace
 .venv/Scripts/python.exe run.py
 ```
+
+### One-click alternative: the `codexcont` CLI
+
+A bundled CLI wraps the steps above into a guided installer plus a background service
+manager. It asks for confirmation before installing or writing `config.toml`, and lets you
+start/stop the proxy and view its logs at any time:
+
+```bash
+./codexcont install   # confirms, then installs deps + writes config.toml interactively
+./codexcont start     # start the proxy in the background
+./codexcont logs -f   # follow its logs (Ctrl+C to stop following)
+./codexcont stop      # stop it
+./codexcont           # interactive menu -- same actions, no flags to remember
+```
+
+`uv`-based equivalents also work: `uv run codexcont install`, or, without cloning the repo,
+`uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont`. On Windows, use
+`codexcont.bat` in place of `./codexcont`. Run `./codexcont --help` for every subcommand,
+including `wire-codex` / `unwire-codex` (points the Codex CLI's built-in provider at this
+proxy via the top-level `openai_base_url` key -- no `model_provider` switch, so conversation
+history stays visible).
+
+This CLI only manages CodexCont itself (dependencies, `config.toml`, the server process); it
+doesn't edit other tools' configs on its own (`wire-codex` aside). For a fully guided,
+backed-up wiring of any coding agent, hand an AI agent
+[`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md).
 
 ## Point your client at the proxy
 
@@ -164,12 +191,15 @@ Current offline coverage includes:
 - upstream URL resolution
 - auth safety guard
 - EOF/upstream-error behavior
+- `GET /v1/models` / `/v1/models/{id}` / `/health`
+- the `codexcont` CLI's config.toml text-surgery and Codex `openai_base_url` wiring helpers
 
 ## Project layout
 
 ```text
 middleware/
   app.py       # Starlette app and route handler
+  cli.py       # `codexcont` CLI: guided installer + background service manager
   codex.py     # truncation math and continuation payload builders
   config.py    # config.toml loader and dataclasses
   creds.py     # upstream header/auth construction
@@ -182,6 +212,7 @@ tests/
   fixtures/
 
 run.py         # uvicorn entrypoint
+codexcont      # one-click POSIX entrypoint for the CLI (codexcont.bat on Windows)
 config.example.toml # example runtime configuration; copy to config.toml for local use
 ```
 

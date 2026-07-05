@@ -1,7 +1,7 @@
 [project]
-name = "gptpoc"
+name = "codexcont"
 version = "0.1.0"
-description = "Continue-thinking middleware for the Codex/GPT API."
+description = "Continue-thinking middleware for Codex / OpenAI Responses-compatible APIs."
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
@@ -9,5 +9,15 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.scripts]
+codexcont = "middleware.cli:main"
+
 [dependency-groups]
 dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["middleware"]

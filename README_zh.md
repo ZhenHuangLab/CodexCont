@@ -21,6 +21,7 @@
 - 如果本轮被判定为截断，丢弃暂定输出，并携带已产生的 reasoning 打开下一轮续写请求。
 - 如果本轮自然完成或触发安全上限，冲刷最终一轮的输出，并发出一个重构后的 terminal response。
 - 对不符合条件的请求透明透传。
+- `GET /v1/models`（以及 `/v1/models/{id}`、`/health`）会返回一个占位模型列表而不是 404 —— Codex 等客户端会轮询这个接口。
 
 默认续写方式是隐藏的 `phase: "commentary"` assistant 消息（`"Continue thinking..."`）。也支持旧版的合成工具调用对（`tool_pair`）模式。
 
@@ -55,6 +56,28 @@ uv run python run.py
 # Windows / 本工作区 Git Bash
 .venv/Scripts/python.exe run.py
 ```
+
+### 一键替代方案：`codexcont` 命令行工具
+
+内置的 CLI 把上面这些步骤包装成了一个引导式安装器 + 后台服务管理器：安装或写入 `config.toml` 前都会先询问确认，随时可以启动/停止代理、查看日志：
+
+```bash
+./codexcont install   # 先确认，再交互式安装依赖 + 写入 config.toml
+./codexcont start     # 在后台启动代理
+./codexcont logs -f   # 跟随查看日志（Ctrl+C 停止跟随）
+./codexcont stop      # 停止代理
+./codexcont           # 交互式菜单 —— 无需记忆参数
+```
+
+也可以用 `uv` 直接运行：`uv run codexcont install`；或者不克隆仓库，直接用
+`uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont`。Windows 上用
+`codexcont.bat` 代替 `./codexcont`。运行 `./codexcont --help` 查看全部子命令，包括
+`wire-codex` / `unwire-codex`（通过顶层的 `openai_base_url` 配置项把 Codex CLI 内置
+provider 指向本代理 —— 不切换 `model_provider`，会话历史依旧可见）。
+
+这个 CLI 只管理 CodexCont 自身（依赖、`config.toml`、服务进程）；除 `wire-codex` 外不会
+自动修改其他工具的配置。如果需要为任意编码 Agent 做一次完整的、带备份的接入引导，请把
+[`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md) 交给一个 AI Agent 执行。
 
 ## 将客户端指向代理
 
@@ -162,12 +185,15 @@ uv run python tests/test_middleware.py
 - 上游 URL 解析
 - 鉴权安全保护
 - EOF / 上游错误处理
+- `GET /v1/models`、`/v1/models/{id}`、`/health`
+- `codexcont` CLI 的 config.toml 文本编辑和 Codex `openai_base_url` 接入辅助函数
 
 ## 项目结构
 
 ```text
 middleware/
   app.py       # Starlette 应用和路由处理
+  cli.py       # `codexcont` CLI：引导式安装器 + 后台服务管理器
   codex.py     # 截断数学和续写 payload 构造
   config.py    # config.toml 加载和 dataclass 配置
   creds.py     # 上游 header / auth 构造
@@ -180,6 +206,7 @@ tests/
   fixtures/
 
 run.py         # uvicorn 入口
+codexcont      # 一键 CLI 入口（POSIX shell；Windows 用 codexcont.bat）
 config.example.toml # 示例运行配置；复制为 config.toml 后本地使用
 ```
 

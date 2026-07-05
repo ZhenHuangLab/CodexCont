@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+build/
 
 # Virtual env
 .venv/
@@ -18,5 +19,8 @@ __pycache__/
 config.toml
 rt.json
 free_rt.json
+
+# codexcont CLI runtime state (pid file, background log, saved proxy env)
+.codexcont/
 
 legacy/

@@ -42,6 +42,14 @@ repair_followup = "off"            # tool_pair cross-turn: "off" (default) | "st
                                    # that preserve them — commentary's forward_marker is preferred)
 max_total_output_tokens = 0        # optional cumulative cost cap across rounds (0 = off)
 
+[models]
+# Advertised at GET /v1/models and GET /v1/models/{id}. Cosmetic only — a real
+# POST /v1/responses request forwards whatever `model` the caller sends,
+# regardless of this list. This just gives clients that poll GET /v1/models
+# (Codex included) a real 200 instead of a 404 (previously logged as noise).
+ids = ["gpt-5.5", "gpt-5.4-mini", "gpt-5.4", "gpt-5.3-codex"]
+owned_by = "codexcont"
+
 [stream]
 force_include_encrypted = true     # add reasoning.encrypted_content upstream; always forwarded downstream
 rechunk_final_answer = true        # re-slice the buffered final message into small synthetic deltas
