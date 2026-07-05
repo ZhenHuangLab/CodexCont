@@ -224,9 +224,10 @@ async def test_fold_real_captures():
         and (e.get("item") or {}).get("type") == "reasoning"
     ]
     check("fold 2 reasoning items", len(rdone) == 2, str(len(rdone)))
+    # forward_marker defaults true → the commentary marker owns ds_oi 1
     check(
-        "fold reasoning oi 0,1",
-        [e["output_index"] for e in rdone] == [0, 1],
+        "fold reasoning oi 0,2 (marker at 1)",
+        [e["output_index"] for e in rdone] == [0, 2],
         str([e.get("output_index") for e in rdone]),
     )
 
@@ -250,8 +251,8 @@ async def test_fold_real_captures():
     )
     out_items = (completed.get("response") or {}).get("output") or []
     check(
-        "fold reconstructed output non-empty (3 items)",
-        len(out_items) == 3,
+        "fold reconstructed output non-empty (4 items incl. marker)",
+        len(out_items) == 4,
         str(len(out_items)),
     )
     # Agent-facing usage = single-response equivalent (NOT summed input).
@@ -406,7 +407,9 @@ def _round(rs_id, enc, reasoning_tokens_val, *, extra_items=None, msg=None):
 
 
 async def test_truncated_tool_call_discarded():
-    cfg = load_config(ROOT / "config.toml")
+    base = load_config(ROOT / "config.toml")
+    # marker forwarding is covered elsewhere; keep the delta stream bare here
+    cfg = replace(base, cont=replace(base.cont, forward_marker=False))
     base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
 
     # Round A: truncated (516) + a real tool call. Round B: clean message.
@@ -443,7 +446,8 @@ async def test_truncated_tool_call_discarded():
 
 
 async def test_commentary_continuation_payload():
-    cfg = load_config(ROOT / "config.toml")  # method = "commentary" by default
+    base = load_config(ROOT / "config.toml")  # method = "commentary" by default
+    cfg = replace(base, cont=replace(base.cont, forward_marker=False))
     base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
     rA = FakeResp(_round("rs_a", "ENC_A", 516, msg="trunc"))  # truncated → continue
     rB = FakeResp(_round("rs_b", "ENC_B", 999, msg="done"))  # clean → stop
@@ -485,9 +489,9 @@ async def test_commentary_continuation_payload():
             for x in inp
         ),
     )
-    # forward_marker defaults false → marker stays hidden from the downstream stream
+    # forward_marker=false → marker stays hidden from the downstream stream
     check(
-        "commentary: marker hidden downstream by default",
+        "commentary: marker hidden downstream when forward_marker=false",
         not any((e.get("item") or {}).get("phase") == "commentary" for e in evs),
     )
 
@@ -1189,9 +1193,10 @@ def test_ws_fold_roundtrip():
     }
     rA = FakeResp(_round("rs_a", "ENC_A", 516, extra_items=[tool]))
     rB = FakeResp(_round("rs_b", "ENC_B", 999, msg="done"))
+    fake = FakeClient([rA, rB])  # round 1, then the continuation
 
     with TestClient(app) as client:
-        app.state.client = FakeClient([rA, rB])  # round 1, then the continuation
+        app.state.client = fake
         with client.websocket_connect("/v1/responses") as ws:
             ws.send_text(
                 json.dumps(
@@ -1209,12 +1214,27 @@ def test_ws_fold_roundtrip():
         bool(evs) and evs[-1].get("type") == "response.completed",
         str(evs[-1].get("type")) if evs else "no events",
     )
+    # round 1 must be shaped by build_round_payload, same as the POST route
+    r1_payload = fake.payloads[0] if fake.payloads else {}
+    check(
+        "ws fold: round-1 payload merges encrypted include",
+        "reasoning.encrypted_content" in (r1_payload.get("include") or []),
+        str(r1_payload.get("include")),
+    )
     has_fc = any((e.get("item") or {}).get("type") == "function_call" for e in evs)
     check("ws fold: truncated tool call discarded", not has_fc)
     deltas = "".join(
-        e.get("delta", "") for e in evs if e.get("type") == "response.output_text.delta"
+        e.get("delta", "")
+        for e in evs
+        if e.get("type") == "response.output_text.delta"
+        and not e.get("item_id", "").startswith("msg_continue_")
     )
     check("ws fold: clean round message flushed", deltas == "done", deltas)
+    # forward_marker defaults true → the commentary marker reaches the agent
+    check(
+        "ws fold: commentary marker forwarded by default",
+        any((e.get("item") or {}).get("phase") == "commentary" for e in evs),
+    )
     rounds = ((evs[-1].get("response") or {}).get("metadata") or {}).get("proxy_rounds")
     check(
         "ws fold: both rounds recorded in metadata",
@@ -1373,6 +1393,153 @@ def test_ws_previous_response_id_chain():
     )
 
 
+def _passthrough_round(resp_id: str, text: str) -> bytes:
+    """A message-only stream whose terminal carries NO `output` (codex-backend
+    shape), so chain recording must fall back to the output_item.done items."""
+    events = [
+        {
+            "type": "response.created",
+            "response": {"id": resp_id, "status": "in_progress"},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": f"msg_{resp_id}", "type": "message"},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": f"msg_{resp_id}",
+            "delta": text,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": f"msg_{resp_id}",
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {"id": resp_id, "status": "completed"},
+        },
+    ]
+    return make_sse(events)
+
+
+def test_ws_passthrough_chain_recorded():
+    """A passthrough WS turn (reasoning=false, never folded) must still record
+    its chain, or the next chained turn silently loses all prior context."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    fake = FakeClient(
+        [
+            FakeResp(_passthrough_round("resp_pt1", "pt-answer")),
+            FakeResp(_passthrough_round("resp_pt2", "pt-answer-2")),
+        ]
+    )
+
+    with TestClient(app) as client:
+        app.state.client = fake
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "reasoning": False,
+                        "input": [{"role": "user", "content": "pt-turn-1"}],
+                    }
+                )
+            )
+            _ws_drain(ws)
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "reasoning": False,
+                        "previous_response_id": "resp_pt1",
+                        "input": [{"role": "user", "content": "pt-turn-2"}],
+                    }
+                )
+            )
+            evs2 = _ws_drain(ws)
+
+    check(
+        "ws passthrough chain: turn2 completes cleanly",
+        bool(evs2) and evs2[-1].get("type") == "response.completed",
+        str(evs2[-1] if evs2 else "no events"),
+    )
+    sent = fake.payloads[-1] if fake.payloads else {}
+    check(
+        "ws passthrough chain: previous_response_id dropped before upstream",
+        "previous_response_id" not in sent,
+    )
+    blob = json.dumps(sent.get("input"))
+    check(
+        "ws passthrough chain: turn-1 input AND output spliced into turn-2",
+        "pt-turn-1" in blob and "pt-answer" in blob and "pt-turn-2" in blob,
+        blob,
+    )
+
+
+def test_http_passthrough_chain_recorded():
+    """Same as above for the POST route: the raw stream is teed through an SSE
+    parser purely to record the chain; bytes reach the agent untouched."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    fake = FakeClient(
+        [
+            FakeResp(_passthrough_round("resp_h1", "h1-answer")),
+            FakeResp(_passthrough_round("resp_h2", "h2-answer")),
+        ]
+    )
+
+    with TestClient(app) as client:
+        app.state.client = fake
+        r1 = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.5",
+                "stream": True,
+                "reasoning": False,
+                "input": [{"role": "user", "content": "h-turn-1"}],
+            },
+        )
+        r2 = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.5",
+                "stream": True,
+                "reasoning": False,
+                "previous_response_id": "resp_h1",
+                "input": [{"role": "user", "content": "h-turn-2"}],
+            },
+        )
+
+    check("http passthrough chain: turn1 200", r1.status_code == 200)
+    check(
+        "http passthrough chain: bytes relayed untouched",
+        "h1-answer" in r1.text,
+        r1.text[:80],
+    )
+    check("http passthrough chain: turn2 200", r2.status_code == 200)
+    sent = fake.payloads[-1] if fake.payloads else {}
+    check(
+        "http passthrough chain: previous_response_id dropped before upstream",
+        "previous_response_id" not in sent,
+    )
+    blob = json.dumps(sent.get("input"))
+    check(
+        "http passthrough chain: turn-1 input AND output spliced into turn-2",
+        "h-turn-1" in blob and "h1-answer" in blob and "h-turn-2" in blob,
+        blob,
+    )
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -1399,6 +1566,8 @@ async def _main():
     test_ws_passthrough()
     test_ws_round1_error()
     test_ws_previous_response_id_chain()
+    test_ws_passthrough_chain_recorded()
+    test_http_passthrough_chain_recorded()
 
 
 def main():

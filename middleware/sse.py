@@ -1,10 +1,12 @@
 """Incremental SSE framing for a streaming proxy.
 
-The PoC parsed the whole body at once; a live proxy cannot. `incremental_sse`
-consumes an async byte iterator, reassembles SSE events across arbitrary chunk
-boundaries, and yields parsed event objects as soon as each event completes.
+The PoC parsed the whole body at once; a live proxy cannot. `SSEAccumulator`
+consumes byte chunks, reassembles SSE events across arbitrary chunk
+boundaries, and returns parsed event objects as soon as each event completes.
+`incremental_sse` wraps it for async byte iterators; the passthrough tee in
+app.py feeds it chunk-by-chunk while forwarding the same bytes untouched.
 
-Yields:
+Events:
   - dict  : the parsed JSON of a `data:` event
   - DONE  : the sentinel for a `data: [DONE]` terminal line
 Malformed JSON data lines are skipped (lenient, matching PoC behavior).
@@ -24,21 +26,23 @@ def _decode_line(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace").rstrip("\r")
 
 
-async def incremental_sse(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[Any]:
-    """Frame an async byte stream into SSE events.
+class SSEAccumulator:
+    """Stateful chunk-at-a-time SSE parser.
 
     An event is terminated by a blank line. Multiple `data:` lines within one
     event are concatenated with newlines (per the SSE spec). `event:` and
     comment (`:`) lines are ignored — the JSON payload carries its own `type`.
     """
-    buffer = b""
-    data_lines: list[str] = []
 
-    def flush_event():
-        if not data_lines:
+    def __init__(self) -> None:
+        self._buffer = b""
+        self._data_lines: list[str] = []
+
+    def _flush_event(self):
+        if not self._data_lines:
             return None
-        payload = "\n".join(data_lines)
-        data_lines.clear()
+        payload = "\n".join(self._data_lines)
+        self._data_lines.clear()
         if payload == DONE:
             return ("done",)
         try:
@@ -46,18 +50,20 @@ async def incremental_sse(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[Any]
         except json.JSONDecodeError:
             return None
 
-    async for chunk in byte_iter:
+    def feed(self, chunk: bytes) -> list[Any]:
+        """Consume one byte chunk; return the events it completed (dict | DONE)."""
+        out: list[Any] = []
         if not chunk:
-            continue
-        buffer += chunk
-        while b"\n" in buffer:
-            raw, buffer = buffer.split(b"\n", 1)
+            return out
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            raw, self._buffer = self._buffer.split(b"\n", 1)
             line = _decode_line(raw)
 
             if line == "":
-                ev = flush_event()
+                ev = self._flush_event()
                 if ev is not None:
-                    yield DONE if ev[0] == "done" else ev[1]
+                    out.append(DONE if ev[0] == "done" else ev[1])
                 continue
             if line.startswith(":"):
                 continue  # comment
@@ -65,13 +71,26 @@ async def incremental_sse(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[Any]
                 val = line[5:]
                 if val.startswith(" "):
                     val = val[1:]
-                data_lines.append(val)
+                self._data_lines.append(val)
             # `event:` / `id:` / `retry:` lines: ignored (type lives in JSON).
+        return out
 
-    # Flush a trailing event with no terminating blank line.
-    ev = flush_event()
-    if ev is not None:
-        yield DONE if ev[0] == "done" else ev[1]
+    def finish(self) -> list[Any]:
+        """Flush a trailing event with no terminating blank line."""
+        ev = self._flush_event()
+        if ev is None:
+            return []
+        return [DONE if ev[0] == "done" else ev[1]]
+
+
+async def incremental_sse(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[Any]:
+    """Frame an async byte stream into SSE events (see SSEAccumulator)."""
+    acc = SSEAccumulator()
+    async for chunk in byte_iter:
+        for ev in acc.feed(chunk):
+            yield ev
+    for ev in acc.finish():
+        yield ev
 
 
 def serialize_event(event: dict[str, Any]) -> bytes:

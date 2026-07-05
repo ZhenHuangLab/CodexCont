@@ -61,9 +61,11 @@ class ContinueCfg:
     )
     marker_text: str = "Continue thinking..."  # commentary path: assistant message text
     forward_marker: bool = (
-        False  # commentary path: emit the marker downstream so the agent
+        True  # commentary path: emit the marker downstream so the agent
     )
-    # echoes it back next turn (cross-turn structure + prompt-cache); false = hidden/clean.
+    # echoes it back next turn (cross-turn structure + prompt-cache: next turn's
+    # input then extends the last upstream round exactly); false = hidden/clean
+    # transcript at the cost of a per-turn cache miss over the folded reasoning.
     # --- tool_pair path only (legacy; used when method = "tool_pair") ---
     continue_tool_name: str = (
         "continue_thinking"  # synthetic tool name + collision-bypass name

@@ -29,7 +29,7 @@ from .codex import (
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .proxy import fold_stream, open_passthrough, open_round
-from .sse import DONE, incremental_sse
+from .sse import DONE, SSEAccumulator, incremental_sse
 from .store import ChainStore, IdStore
 
 log = logging.getLogger("middleware.app")
@@ -82,16 +82,62 @@ def _url_is_from_header(cfg: Config, request: HeaderSource) -> bool:
     )
 
 
+_TERMINAL_TYPES = ("response.completed", "response.failed", "response.incomplete")
+
+
+class _ChainRecorder:
+    """Record a passthrough turn's chain the way the fold path's
+    `_record_chain` does, so a later turn chaining off this response via
+    `previous_response_id` still resolves (see the WebSocket module note
+    below). Feed it every parsed upstream event; on the terminal event it
+    stores `[*input, *output]` under the response id."""
+
+    def __init__(self, chain_store: Any, orig_input: list[Any]) -> None:
+        self._store = chain_store
+        self._input = orig_input
+        self._items: list[dict[str, Any]] = []
+
+    def observe(self, ev: Any) -> None:
+        if self._store is None or not isinstance(ev, dict):
+            return
+        t = ev.get("type")
+        if t == "response.output_item.done" and isinstance(ev.get("item"), dict):
+            self._items.append(ev["item"])
+        elif t in _TERMINAL_TYPES:
+            resp = ev.get("response") or {}
+            rid = resp.get("id")
+            # Codex-backend terminals carry an empty `output`; fall back to
+            # the output_item.done items collected along the way.
+            output = resp.get("output") or self._items
+            if rid:
+                self._store.set(rid, [*self._input, *output])
+
+
 async def _passthrough(
-    client: httpx.AsyncClient, cfg: Config, request: Request, raw: bytes, url: str
+    client: httpx.AsyncClient,
+    cfg: Config,
+    request: Request,
+    raw: bytes,
+    url: str,
+    body: dict[str, Any],
+    chain_store: Any,
 ):
-    """Pure proxy: forward the raw request and stream the raw response back."""
+    """Pure proxy: forward the raw request and stream the raw response back.
+
+    The bytes go downstream untouched, but an SSE parser tees off the stream
+    so this turn's response id still lands in `chain_store` -- without it, a
+    later turn chaining off a passthrough response via `previous_response_id`
+    would silently lose all prior context."""
     headers = build_upstream_headers(request.headers.items(), cfg)
     resp = await open_passthrough(client, url, raw, headers)
+    recorder = _ChainRecorder(chain_store, list(body.get("input") or []))
+    acc = SSEAccumulator()
 
     async def body_iter():
         try:
             async for chunk in resp.aiter_bytes():
+                for ev in acc.feed(chunk):
+                    recorder.observe(ev)
                 yield chunk
         finally:
             await resp.aclose()
@@ -202,7 +248,9 @@ async def handle_responses(request: Request) -> Response:
             request.url.path,
             url,
         )
-        return await _passthrough(client, cfg, request, raw, url)
+        return await _passthrough(
+            client, cfg, request, raw, url, body, request.app.state.chain_store
+        )
 
     log.info(
         "fold start: model=%s path=%s url=%s input_items=%d",
@@ -321,11 +369,18 @@ async def _events_from_byte_stream(
 
 
 async def _ws_open_events(
-    client: httpx.AsyncClient, url: str, body: dict[str, Any], headers: dict[str, str]
+    client: httpx.AsyncClient,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    chain_store: Any = None,
 ) -> AsyncGenerator[Any, None]:
     """Open one non-folding upstream round for a WebSocket turn and yield its
-    parsed events (or a single `error` event if the round can't be opened)."""
+    parsed events (or a single `error` event if the round can't be opened).
+    Every event also feeds a `_ChainRecorder`, so a passthrough turn can be
+    chained off via `previous_response_id` just like a folded one."""
     resp = await open_round(client, url, body, headers)
+    recorder = _ChainRecorder(chain_store, list(body.get("input") or []))
     try:
         if resp.status_code >= 400:
             message, code = _upstream_error_message(await resp.aread())
@@ -333,6 +388,7 @@ async def _ws_open_events(
             return
         async for ev in incremental_sse(resp.aiter_bytes()):
             if ev is not DONE:
+                recorder.observe(ev)
                 yield ev
     finally:
         await resp.aclose()
@@ -370,7 +426,28 @@ async def _handle_response_create(
     )
 
     if should_fold:
-        resp = await open_round(client, url, body, headers)
+        # Mirror the HTTP fold path exactly: the stateful tool_pair repair,
+        # then a round-1 payload shaped by build_round_payload (forces
+        # stream=True, merges `include: reasoning.encrypted_content`, drops
+        # previous_response_id). Without the include merge, an agent that
+        # doesn't request encrypted reasoning itself would leave round 1
+        # without `encrypted_content` and continuation could never fire.
+        if cfg.cont.repair_followup == "stateful" and cfg.cont.method == "tool_pair":
+            body = {
+                **body,
+                "input": repair_followup_input(
+                    list(body.get("input") or []),
+                    id_store,
+                    tool_name=cfg.cont.continue_tool_name,
+                    output_text=cfg.cont.continue_output_text,
+                ),
+            }
+        payload = build_round_payload(
+            body,
+            input_items=list(body.get("input") or []),
+            force_include_encrypted=cfg.stream.force_include_encrypted,
+        )
+        resp = await open_round(client, url, payload, headers)
         if resp.status_code >= 400:
             message, code = _upstream_error_message(await resp.aread())
             await resp.aclose()
@@ -391,7 +468,7 @@ async def _handle_response_create(
             )
         )
     else:
-        event_source = _ws_open_events(client, url, body, headers)
+        event_source = _ws_open_events(client, url, body, headers, chain_store)
 
     async with contextlib.aclosing(event_source) as events:
         async for ev in events:

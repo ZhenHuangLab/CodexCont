@@ -30,10 +30,12 @@ method = "commentary"              # continuation provocation method:
                                    #   "tool_pair" = synthetic continue_thinking function_call + output
 marker_text = "Continue thinking..."   # commentary path: the assistant message text that nudges
                                        # the model to keep thinking
-forward_marker = false             # commentary path: also emit the marker into the DOWNSTREAM output
+forward_marker = true              # commentary path: also emit the marker into the DOWNSTREAM output
                                    # so the agent echoes it back next turn (preserves cross-turn
-                                   # reasoning structure + prompt-cache; codex & pi both verified to
-                                   # preserve `phase`). false = hidden (clean agent history).
+                                   # reasoning structure + prompt-cache: next turn's input extends the
+                                   # last upstream round exactly; codex & pi both verified to preserve
+                                   # `phase`). false = hidden (clean agent history) at the cost of a
+                                   # per-turn prompt-cache miss over the folded reasoning.
 # --- tool_pair path only (used when method = "tool_pair") ---
 continue_tool_name = "continue_thinking"   # synthetic tool name; ALSO the collision-bypass name: if
                                            # the agent itself DECLARES a tool with this name, the proxy
