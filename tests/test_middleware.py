@@ -749,12 +749,45 @@ def test_paths_resolution():
             os.environ[ENV_HOME] = old_home
 
 
+class _CannedHTTP:
+    """Answers client.request() (the /v1/* passthrough path) with one canned
+    response; records every call."""
+
+    def __init__(self, status: int = 200, body: bytes = b"{}"):
+        self.status = status
+        self.body = body
+        self.calls: list[tuple[str, str]] = []
+
+    async def request(self, method, url, content=None, headers=None, timeout=None):
+        self.calls.append((method, url))
+
+        class _R:
+            status_code = self.status
+            content = self.body
+            headers = {"content-type": "application/json"}
+
+        return _R()
+
+    async def aclose(self):
+        pass
+
+
+class _NoNetworkHTTP:
+    async def request(self, *a, **k):
+        raise ConnectionError("offline")
+
+    async def aclose(self):
+        pass
+
+
 def test_models_endpoint():
-    """GET /v1/models (and /v1/models/{id}, /health) must 200, not 404 --
-    clients like Codex poll this and used to just get noisy 404s."""
+    """GET /v1/models must 200 -- real upstream catalog when reachable,
+    fallback to the configured cosmetic list when not (never a 404)."""
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
     with TestClient(app) as client:
+        # upstream unreachable -> cosmetic fallback list
+        app.state.client = _NoNetworkHTTP()
         r = client.get("/v1/models", params={"client_version": "0.142.5"})
         check(
             "models list: 200 (no more 404 noise)",
@@ -770,12 +803,50 @@ def test_models_endpoint():
         )
         check("models list: ids match config", ids == list(cfg.models.ids), str(ids))
 
+        # upstream reachable -> its real catalog is forwarded instead
+        canned = _CannedHTTP(
+            body=json.dumps(
+                {"object": "list", "data": [{"id": "real-upstream-model"}]}
+            ).encode()
+        )
+        app.state.client = canned
+        r2 = client.get("/v1/models")
+        check(
+            "models list: real upstream catalog preferred",
+            [m.get("id") for m in r2.json().get("data", [])]
+            == ["real-upstream-model"],
+            r2.text[:80],
+        )
+        check(
+            "models list: upstream URL derived from responses base",
+            bool(canned.calls) and canned.calls[0][1].endswith("/models"),
+            str(canned.calls),
+        )
+
         one = client.get(f"/v1/models/{cfg.models.ids[0]}")
         check("models get: 200", one.status_code == 200, str(one.status_code))
         check("models get: id echoed", one.json().get("id") == cfg.models.ids[0])
 
         health = client.get("/health")
         check("health: 200", health.status_code == 200, str(health.status_code))
+
+
+def test_v1_catchall_passthrough():
+    """Any other /v1/* call must reach the upstream base transparently."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    canned = _CannedHTTP(body=b'{"ok": true}')
+    with TestClient(app) as client:
+        app.state.client = canned
+        r = client.get("/v1/some/unknown/endpoint?limit=5")
+        check("v1 catch-all: upstream status/body relayed", r.status_code == 200)
+        check("v1 catch-all: body forwarded", r.json() == {"ok": True}, r.text[:80])
+        called = canned.calls[0][1] if canned.calls else ""
+        check(
+            "v1 catch-all: path + query forwarded to upstream base",
+            called.endswith("/some/unknown/endpoint?limit=5"),
+            called,
+        )
 
 
 def test_upstream_url_resolution():
@@ -1540,6 +1611,42 @@ def test_http_passthrough_chain_recorded():
     )
 
 
+def test_compressed_request_body():
+    """zstd/gzip-compressed POST bodies (Codex's built-in provider with request
+    compression on) must be decompressed before parsing and forwarding."""
+    import gzip
+
+    import zstandard
+
+    cfg = load_config(ROOT / "config.toml")
+    for enc, compress in (
+        ("gzip", gzip.compress),
+        ("zstd", lambda b: zstandard.ZstdCompressor().compress(b)),
+    ):
+        app = create_app(cfg)
+        fake = FakeClient([FakeResp(_passthrough_round(f"resp_{enc}", "z-answer"))])
+        body = {
+            "model": "gpt-5.5",
+            "stream": True,
+            "reasoning": False,
+            "input": [{"role": "user", "content": f"{enc}-marker"}],
+        }
+        with TestClient(app) as client:
+            app.state.client = fake
+            r = client.post(
+                "/v1/responses",
+                content=compress(json.dumps(body).encode()),
+                headers={"content-type": "application/json", "content-encoding": enc},
+            )
+        check(f"compressed body ({enc}): 200", r.status_code == 200, r.text[:80])
+        sent = fake.payloads[-1] if fake.payloads else {}
+        check(
+            f"compressed body ({enc}): decompressed before forwarding",
+            f"{enc}-marker" in json.dumps(sent.get("input")),
+            str(sent)[:80],
+        )
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -1555,6 +1662,7 @@ async def _main():
     test_cli_toml_helpers()
     test_paths_resolution()
     test_models_endpoint()
+    test_v1_catchall_passthrough()
     test_upstream_url_resolution()
     test_auth_safety_guard()
     test_auth_injection()
@@ -1568,6 +1676,7 @@ async def _main():
     test_ws_previous_response_id_chain()
     test_ws_passthrough_chain_recorded()
     test_http_passthrough_chain_recorded()
+    test_compressed_request_body()
 
 
 def main():

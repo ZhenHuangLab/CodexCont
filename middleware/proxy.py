@@ -33,6 +33,11 @@ log = logging.getLogger("middleware.proxy")
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
 
+# Bounded instead of the previous timeout=None (a hung upstream held the round
+# forever). read= is the gap between chunks, not the whole stream, so 600s
+# tolerates long reasoning pauses while still eventually surfacing a dead peer.
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)
+
 
 async def open_round(
     client: httpx.AsyncClient,
@@ -46,7 +51,9 @@ async def open_round(
     invent a Content-Type — it comes from the passed-through agent headers.
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
+    req = client.build_request(
+        "POST", url, content=body, headers=headers, timeout=UPSTREAM_TIMEOUT
+    )
     return await client.send(req, stream=True)
 
 
@@ -58,7 +65,7 @@ async def open_passthrough(
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
     req = client.build_request(
-        "POST", url, content=raw_body, headers=headers, timeout=None
+        "POST", url, content=raw_body, headers=headers, timeout=UPSTREAM_TIMEOUT
     )
     return await client.send(req, stream=True)
 

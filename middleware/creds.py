@@ -25,6 +25,10 @@ _CLIENT_OWNED = {
     "proxy-connection",
     "transfer-encoding",
     "accept-encoding",
+    # The middleware decompresses zstd/gzip/deflate request bodies before
+    # forwarding, so the original Content-Encoding no longer describes the
+    # bytes we send upstream.
+    "content-encoding",
     # WebSocket handshake-only headers: meaningless on the plain HTTP round we
     # always speak upstream, even when the downstream leg was a WebSocket
     # connection (see app.py's handle_responses_ws).

@@ -8,11 +8,14 @@ so it is safe in front of all traffic.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import logging
+import zlib
 from typing import Any, AsyncGenerator
 
 import httpx
+import zstandard
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -37,6 +40,26 @@ log = logging.getLogger("middleware.app")
 # An HTTP Request and a WebSocket handshake both expose a case-insensitive
 # `.headers` mapping, which is all the header-resolution helpers below need.
 HeaderSource = Request | WebSocket
+
+
+def _decompress_body(data: bytes, encoding: str | None) -> bytes:
+    """Codex's built-in provider sends zstd-compressed request bodies when
+    request compression is enabled (gzip/deflate for completeness). Decompress
+    before parsing/forwarding; creds.py drops Content-Encoding upstream since
+    the forwarded bytes are plain."""
+    enc = (encoding or "").lower().strip()
+    if not enc or enc == "identity":
+        return data
+    try:
+        if enc == "zstd":
+            return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        if enc == "gzip":
+            return gzip.decompress(data)
+        if enc == "deflate":
+            return zlib.decompress(data)
+    except Exception as exc:
+        raise ValueError(f"failed to decompress {enc} body: {exc}") from exc
+    raise ValueError(f"unsupported content-encoding: {enc}")
 
 
 def _header_base(request: HeaderSource) -> str | None:
@@ -182,9 +205,10 @@ async def handle_responses(request: Request) -> Response:
 
     raw = await request.body()
     try:
+        raw = _decompress_body(raw, request.headers.get("content-encoding"))
         body: dict[str, Any] = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    except ValueError as exc:  # bad encoding or bad JSON
+        return JSONResponse({"error": f"invalid request body: {exc}"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
 
@@ -546,23 +570,87 @@ def _model_object(model_id: str, owned_by: str) -> dict[str, Any]:
     return {"id": model_id, "object": "model", "created": 0, "owned_by": owned_by}
 
 
+def _upstream_base(url: str) -> str:
+    """The upstream base for non-/responses calls (responses URL minus suffix)."""
+    return url[: -len("/responses")] if url.endswith("/responses") else url
+
+
+async def _proxy_v1(request: Request, suffix: str) -> Response | None:
+    """Forward one non-/responses /v1/* call to the upstream base, or None
+    when no upstream is resolvable / the auth safety guard applies (same rule
+    as handle_responses: never send configured credentials to a URL the
+    request itself supplied)."""
+    cfg: Config = request.app.state.cfg
+    client: httpx.AsyncClient = request.app.state.client
+    url = _resolve_upstream_url(cfg, request)
+    if url is None:
+        return None
+    if _url_is_from_header(cfg, request) and would_inject_authorization(
+        cfg, agent_has_authorization=request.headers.get("authorization") is not None
+    ):
+        return None
+    target = f"{_upstream_base(url)}/{suffix}"
+    if request.url.query:
+        target += "?" + request.url.query
+    content = await request.body()
+    if content:
+        content = _decompress_body(content, request.headers.get("content-encoding"))
+    headers = build_upstream_headers(request.headers.items(), cfg)
+    upstream = await client.request(
+        request.method,
+        target,
+        content=content or None,
+        headers=headers,
+        timeout=httpx.Timeout(60.0),
+    )
+    # httpx already decompressed the body; drop the now-stale framing headers.
+    drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
+    return Response(
+        upstream.content,
+        status_code=upstream.status_code,
+        headers={k: v for k, v in upstream.headers.items() if k.lower() not in drop},
+    )
+
+
 async def handle_models(request: Request) -> Response:
-    """GET /v1/models -- a minimal OpenAI-compatible model list.
+    """GET /v1/models -- real upstream catalog when reachable, cosmetic list
+    otherwise.
 
     Several clients (Codex included) periodically poll this endpoint, e.g. to
-    populate a model picker. CodexCont used to only implement POST
-    /v1/responses, so this always 404'd -- harmless, but noisy in logs. The
-    advertised ids are purely cosmetic: CodexCont does not restrict which
-    model a real request may use, it forwards whatever `model` the caller
-    sends. Configure the advertised list via `[models]` in config.toml.
+    populate a model picker. Try the upstream first (full /v1/* passthrough,
+    real catalog); on any failure fall back to the `[models]` list from
+    config.toml so the client still gets a 200. The advertised ids never
+    restrict anything: a real request forwards whatever `model` it carries.
     """
     cfg: Config = request.app.state.cfg
+    try:
+        resp = await _proxy_v1(request, "models")
+        if resp is not None and resp.status_code < 400:
+            return resp
+    except Exception as exc:
+        log.info("models passthrough failed (%r); serving local list", exc)
     return JSONResponse(
         {
             "object": "list",
             "data": [_model_object(mid, cfg.models.owned_by) for mid in cfg.models.ids],
         }
     )
+
+
+async def handle_v1_passthrough(request: Request) -> Response:
+    """Transparent proxy for every other /v1/* call, so future/unknown
+    endpoints reach the real upstream instead of 404ing at the middleware."""
+    try:
+        resp = await _proxy_v1(request, request.path_params["path"])
+    except ValueError as exc:  # bad content-encoding
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except httpx.HTTPError as exc:
+        return JSONResponse({"error": f"upstream error: {exc}"}, status_code=502)
+    if resp is None:
+        return JSONResponse(
+            {"error": "no upstream resolvable for /v1 passthrough"}, status_code=400
+        )
+    return resp
 
 
 async def handle_model(request: Request) -> Response:
@@ -613,5 +701,11 @@ def create_app(cfg: Config) -> Starlette:
         Route("/v1/models", handle_models, methods=["GET"]),
         Route("/v1/models/{model_id:path}", handle_model, methods=["GET"]),
         Route("/health", handle_health, methods=["GET"]),
+        # Catch-all LAST: everything else under /v1/ goes to the real upstream.
+        Route(
+            "/v1/{path:path}",
+            handle_v1_passthrough,
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"],
+        ),
     ]
     return Starlette(routes=routes, lifespan=lifespan)
