@@ -76,6 +76,10 @@ uv run python run.py
 `wire-codex` / `unwire-codex`（通过顶层的 `openai_base_url` 配置项把 Codex CLI 内置
 provider 指向本代理 —— 不切换 `model_provider`，会话历史依旧可见）。
 
+通过 `uvx` 或 `pip` 安装（非 git clone）时，`config.toml` 默认在 `~/.codexcont/config.toml`，
+日志和 pid 文件也在该目录。可用 `CODEXCONT_CONFIG` 指定配置文件路径，或 `CODEXCONT_HOME`
+指定数据目录。git clone 本地开发仍在仓库根目录读写 `config.toml`。
+
 这个 CLI 只管理 CodexCont 自身（依赖、`config.toml`、服务进程）；除 `wire-codex` 外不会
 自动修改其他工具的配置。如果需要为任意编码 Agent 做一次完整的、带备份的接入引导，请把
 [`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md) 交给一个 AI Agent 执行。

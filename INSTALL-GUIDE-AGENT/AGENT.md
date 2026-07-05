@@ -32,6 +32,11 @@ pointed at it instead of at the real upstream.
 5. **Idempotent.** It is safe to re-run any step. Check before you create; don't clobber.
 6. **Repo root.** Run repo commands from the directory that contains `run.py`,
    `pyproject.toml`, and `config.example.toml`. Confirm with `ls`.
+
+   If the user runs CodexCont via `uvx`/`pip` instead of a clone, config and runtime
+   state live under `~/.codexcont/` (override with `CODEXCONT_CONFIG` or
+   `CODEXCONT_HOME`). The install wizard still works; skip looking for `config.toml` in
+   the uv cache.
 7. **Leftovers from a previous attempt are common.** Before assuming a clean slate, run the
    pre-check in §2. A stray `[model_providers.codexcont]` block, an old
    `~/.codexcont-backup/` dir, or a process still holding the port will make later steps

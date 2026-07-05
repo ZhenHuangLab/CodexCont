@@ -81,6 +81,11 @@ including `wire-codex` / `unwire-codex` (points the Codex CLI's built-in provide
 proxy via the top-level `openai_base_url` key -- no `model_provider` switch, so conversation
 history stays visible).
 
+When installed via `uvx` or `pip` (not a git clone), `config.toml` lives at
+`~/.codexcont/config.toml` by default; logs and the pid file use the same directory. Override
+with `CODEXCONT_CONFIG` (full path to the config file) or `CODEXCONT_HOME` (data directory).
+A git clone keeps using `config.toml` in the repo root.
+
 This CLI only manages CodexCont itself (dependencies, `config.toml`, the server process); it
 doesn't edit other tools' configs on its own (`wire-codex` aside). For a fully guided,
 backed-up wiring of any coding agent, hand an AI agent

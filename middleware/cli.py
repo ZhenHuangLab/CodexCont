@@ -36,20 +36,33 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-
-ROOT = Path(__file__).resolve().parent.parent
-RUN_PY = ROOT / "run.py"
-CONFIG_PATH = ROOT / "config.toml"
-EXAMPLE_CONFIG_PATH = ROOT / "config.example.toml"
-
-STATE_DIR = ROOT / ".codexcont"
-PID_FILE = STATE_DIR / "codexcont.pid"
-LOG_FILE = STATE_DIR / "codexcont.log"
-ENV_FILE = STATE_DIR / "env.json"
+from . import paths
+from .paths import ENV_CONFIG
 
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 BACKUP_ROOT = Path.home() / ".codexcont-backup"
 WIRE_MARKER = "# codexcont-managed: openai_base_url (added by `codexcont wire-codex`)"
+SERVER_CMD = [sys.executable, "-m", "middleware.server"]
+
+
+def _config_path() -> Path:
+    return paths.config_path()
+
+
+def _state_dir() -> Path:
+    return paths.state_dir()
+
+
+def _pid_file() -> Path:
+    return _state_dir() / "codexcont.pid"
+
+
+def _log_file() -> Path:
+    return _state_dir() / "codexcont.log"
+
+
+def _env_file() -> Path:
+    return _state_dir() / "env.json"
 
 
 # --- tiny interactive helpers ------------------------------------------------
@@ -148,7 +161,7 @@ def _render_summary(text: str) -> str:
 
 
 def _load_cfg():
-    return load_config(CONFIG_PATH)
+    return load_config(_config_path())
 
 
 def _client_host(host: str) -> str:
@@ -182,7 +195,7 @@ def _pid_alive(pid: int) -> bool:
 
 def _read_pid() -> int | None:
     try:
-        return int(PID_FILE.read_text().strip())
+        return int(_pid_file().read_text().strip())
     except (FileNotFoundError, ValueError):
         return None
 
@@ -204,9 +217,11 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
 
 def _spawn_env() -> dict[str, str]:
     env = os.environ.copy()
-    if ENV_FILE.exists():
+    env[ENV_CONFIG] = str(_config_path())
+    env_file = _env_file()
+    if env_file.exists():
         try:
-            extra = json.loads(ENV_FILE.read_text(encoding="utf-8"))
+            extra = json.loads(env_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             extra = {}
         env.update({str(k): str(v) for k, v in extra.items() if v})
@@ -241,8 +256,9 @@ def _follow(path: Path) -> None:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    if not CONFIG_PATH.exists():
-        print(f"{CONFIG_PATH} not found -- run `codexcont install` first.")
+    cfg_path = _config_path()
+    if not cfg_path.exists():
+        print(f"{cfg_path} not found -- run `codexcont install` first.")
         return 1
 
     cfg = _load_cfg()
@@ -258,34 +274,37 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(
             f"Warning: {host}:{cfg.server.port} is already in use by some other process "
             f"(not one this tool started). Stop it first, or change [server].port in "
-            f"{CONFIG_PATH}."
+            f"{cfg_path}."
         )
         return 1
 
     env = _spawn_env()
+    state = _state_dir()
+    log_file = _log_file()
+    pid_file = _pid_file()
 
     if getattr(args, "foreground", False):
         print(
             f"Starting CodexCont in the foreground on http://{host}:{cfg.server.port} (Ctrl+C to stop)..."
         )
-        os.chdir(ROOT)
-        os.execve(sys.executable, [sys.executable, str(RUN_PY)], env)
+        os.chdir(state)
+        os.execve(sys.executable, SERVER_CMD, env)
         raise RuntimeError("unreachable")  # os.execve never returns on success
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as fh:
+    state.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as fh:
         fh.write(f"\n=== codexcont start: {_now()} ===\n")
         fh.flush()
         kwargs: dict[str, Any] = dict(
-            cwd=str(ROOT), stdout=fh, stderr=subprocess.STDOUT, env=env
+            cwd=str(state), stdout=fh, stderr=subprocess.STDOUT, env=env
         )
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        proc = subprocess.Popen([sys.executable, str(RUN_PY)], **kwargs)
+        proc = subprocess.Popen(SERVER_CMD, **kwargs)
 
-    PID_FILE.write_text(str(proc.pid))
+    pid_file.write_text(str(proc.pid))
     print(f"Starting CodexCont in the background (pid {proc.pid})...")
     for _ in range(20):
         if _port_open(cfg.server.host, cfg.server.port):
@@ -303,11 +322,12 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 def cmd_stop(_args: argparse.Namespace) -> int:
     pid = running_pid()
+    pid_file = _pid_file()
     if not pid:
         stale = _read_pid()
         if stale:
             print(f"Not running (stale pid file for {stale}; removing it).")
-            PID_FILE.unlink(missing_ok=True)
+            pid_file.unlink(missing_ok=True)
         else:
             print("Not running.")
         return 0
@@ -324,7 +344,7 @@ def cmd_stop(_args: argparse.Namespace) -> int:
         else:
             print("Still alive after 6s; sending SIGKILL...")
             os.kill(pid, signal.SIGKILL)
-    PID_FILE.unlink(missing_ok=True)
+    pid_file.unlink(missing_ok=True)
     print("Stopped.")
     return 0
 
@@ -339,6 +359,10 @@ def cmd_status(_args: argparse.Namespace) -> int:
     cfg = _load_cfg()
     host = _client_host(cfg.server.host)
     pid = running_pid()
+    cfg_path = _config_path()
+    pid_file = _pid_file()
+    env_file = _env_file()
+    log_file = _log_file()
     if pid:
         print(f"\u25cf running   pid={pid}   http://{host}:{cfg.server.port}")
         reachable = _port_open(cfg.server.host, cfg.server.port)
@@ -349,53 +373,53 @@ def cmd_status(_args: argparse.Namespace) -> int:
         stale = _read_pid()
         if stale:
             print(f"\u25cb not running (stale pid file for {stale}; cleaning up)")
-            PID_FILE.unlink(missing_ok=True)
-        elif not CONFIG_PATH.exists():
+            pid_file.unlink(missing_ok=True)
+        elif not cfg_path.exists():
             print("\u25cb not running  (not installed -- run `codexcont install`)")
         else:
             print("\u25cb not running")
-    if ENV_FILE.exists():
-        print(f"  outbound proxy: configured ({ENV_FILE})")
-    if LOG_FILE.exists():
-        print(f"  log file: {LOG_FILE}")
+    if env_file.exists():
+        print(f"  outbound proxy: configured ({env_file})")
+    if log_file.exists():
+        print(f"  log file: {log_file}")
         print("  last lines:")
-        _print_tail(LOG_FILE, 5)
+        _print_tail(log_file, 5)
     return 0
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    if not LOG_FILE.exists():
+    log_file = _log_file()
+    if not log_file.exists():
         print(
-            f"No log file yet at {LOG_FILE} -- has the server been started in the background?"
+            f"No log file yet at {log_file} -- has the server been started in the background?"
         )
         return 1
     if args.follow:
-        _follow(LOG_FILE)
+        _follow(log_file)
     else:
-        _print_tail(LOG_FILE, args.lines)
+        _print_tail(log_file, args.lines)
     return 0
 
 
 def _wizard_config(existing_cfg: bool, args: argparse.Namespace) -> str | None:
+    cfg_path = _config_path()
     if existing_cfg:
         if args.yes:
             print(
-                f"Keeping the existing {CONFIG_PATH} unchanged (non-interactive install)."
+                f"Keeping the existing {cfg_path} unchanged (non-interactive install)."
             )
             return None
         if not _ask_yes_no(
-            f"{CONFIG_PATH.name} already exists. Reconfigure it now?", default=False
+            f"{cfg_path.name} already exists. Reconfigure it now?", default=False
         ):
-            print(f"Keeping the existing {CONFIG_PATH} unchanged.")
+            print(f"Keeping the existing {cfg_path} unchanged.")
             return None
-        base_path = CONFIG_PATH
+        text = cfg_path.read_text(encoding="utf-8")
     else:
-        base_path = EXAMPLE_CONFIG_PATH
-
-    if not base_path.exists():
-        print(f"Cannot find {base_path}.")
-        return None
-    text = base_path.read_text(encoding="utf-8")
+        text = paths.read_example_config()
+        if text is None:
+            print("Cannot find config.example.toml.")
+            return None
 
     if args.yes:
         return (
@@ -447,9 +471,11 @@ def _wizard_config(existing_cfg: bool, args: argparse.Namespace) -> str | None:
         "\n-- Outbound proxy (only if your network needs one to reach OpenAI, e.g. Clash/mihomo) --"
     )
     proxy = _ask("Proxy URL for CodexCont's own outbound requests (blank = none)", "")
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = _state_dir()
+    env_file = _env_file()
+    state.mkdir(parents=True, exist_ok=True)
     if proxy:
-        ENV_FILE.write_text(
+        env_file.write_text(
             json.dumps(
                 {
                     "http_proxy": proxy,
@@ -461,38 +487,47 @@ def _wizard_config(existing_cfg: bool, args: argparse.Namespace) -> str | None:
             )
         )
         print(
-            f"Saved to {ENV_FILE} (applied automatically whenever `codexcont start` runs)."
+            f"Saved to {env_file} (applied automatically whenever `codexcont start` runs)."
         )
-    elif ENV_FILE.exists() and _ask_yes_no(
+    elif env_file.exists() and _ask_yes_no(
         "Remove the previously saved outbound proxy setting?", default=False
     ):
-        ENV_FILE.unlink()
+        env_file.unlink()
 
     print("\n-- Summary (secrets masked) --\n")
     print(_render_summary(text))
     print()
-    if not _ask_yes_no(f"Write this to {CONFIG_PATH}?", default=True):
+    if not _ask_yes_no(f"Write this to {cfg_path}?", default=True):
         print("Aborted; config.toml left unchanged.")
         return None
     return text
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    cfg_path = _config_path()
     print("=== CodexCont installer ===")
-    print(f"Repo: {ROOT}\n")
+    if paths.is_dev_checkout():
+        print(f"Mode: development checkout ({paths.PACKAGE_ROOT})")
+    else:
+        print("Mode: installed package")
+    print(f"Config: {cfg_path}\n")
 
     if sys.version_info < (3, 12):
         print(f"Python 3.12+ is required (found {sys.version.split()[0]}). Aborting.")
         return 1
 
     has_uv = shutil.which("uv") is not None
-    existing_cfg = CONFIG_PATH.exists()
+    existing_cfg = cfg_path.exists()
+    dev = paths.is_dev_checkout()
 
     print("This will:")
-    print(
-        f"  - install dependencies via {'`uv sync`' if has_uv else 'pip (current interpreter)'}"
-    )
-    print(f"  - {'optionally update' if existing_cfg else 'create'} {CONFIG_PATH}")
+    if dev:
+        print(
+            f"  - install dependencies via {'`uv sync`' if has_uv else 'pip (current interpreter)'}"
+        )
+    else:
+        print("  - skip dependency install (already provided by uvx/pip)")
+    print(f"  - {'optionally update' if existing_cfg else 'create'} {cfg_path}")
     print(
         "\nThis does NOT touch any other tool's config. Use `codexcont wire-codex` for the"
     )
@@ -505,32 +540,37 @@ def cmd_install(args: argparse.Namespace) -> int:
         print("Aborted.")
         return 1
 
-    if has_uv:
-        rc = subprocess.run(["uv", "sync"], cwd=str(ROOT)).returncode
+    if dev:
+        if has_uv:
+            rc = subprocess.run(["uv", "sync"], cwd=str(paths.PACKAGE_ROOT)).returncode
+        else:
+            rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "httpx>=0.27",
+                    "starlette>=0.37",
+                    "uvicorn>=0.30",
+                ],
+                cwd=str(paths.PACKAGE_ROOT),
+            ).returncode
+        if rc != 0:
+            print("Dependency install failed; see the output above.")
+            return rc
     else:
-        rc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "httpx>=0.27",
-                "starlette>=0.37",
-                "uvicorn>=0.30",
-            ],
-            cwd=str(ROOT),
-        ).returncode
-    if rc != 0:
-        print("Dependency install failed; see the output above.")
-        return rc
+        print("Dependencies already installed; skipping.")
+        rc = 0
 
     new_text = _wizard_config(existing_cfg, args)
     if new_text is not None:
-        CONFIG_PATH.write_text(new_text, encoding="utf-8")
-        print(f"Wrote {CONFIG_PATH}")
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(new_text, encoding="utf-8")
+        print(f"Wrote {cfg_path}")
 
     print("\nInstall complete.")
-    if not CONFIG_PATH.exists():
+    if not cfg_path.exists():
         print("No config.toml was written; re-run `codexcont install` to create one.")
         return 0
 
@@ -678,7 +718,7 @@ def _menu() -> int:
         print("\n===================================")
         print(" CodexCont")
         print("===================================")
-        if not CONFIG_PATH.exists():
+        if not _config_path().exists():
             print(" status: not installed")
         elif pid:
             cfg = _load_cfg()

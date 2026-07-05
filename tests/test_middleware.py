@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -664,6 +666,74 @@ def test_cli_toml_helpers():
     )
 
 
+def test_paths_resolution():
+    """middleware/paths.py: dev checkout vs installed package config locations."""
+    from middleware import paths
+    from middleware.paths import ENV_CONFIG, ENV_HOME
+
+    old_config = os.environ.get(ENV_CONFIG)
+    old_home = os.environ.get(ENV_HOME)
+    try:
+        os.environ.pop(ENV_CONFIG, None)
+        os.environ.pop(ENV_HOME, None)
+
+        if paths.is_dev_checkout():
+            check(
+                "paths: dev config in repo root",
+                paths.config_path() == paths.PACKAGE_ROOT / "config.toml",
+            )
+            check(
+                "paths: dev state in repo .codexcont",
+                paths.state_dir() == paths.PACKAGE_ROOT / ".codexcont",
+            )
+
+        with patch("middleware.paths.is_dev_checkout", return_value=False):
+            home = Path.home() / ".codexcont"
+            check(
+                "paths: installed config in ~/.codexcont",
+                paths.config_path() == home / "config.toml",
+            )
+            check("paths: installed state in ~/.codexcont", paths.state_dir() == home)
+
+            os.environ[ENV_HOME] = "/tmp/codexcont-test-home"
+            custom_home = Path("/tmp/codexcont-test-home").resolve()
+            check(
+                "paths: CODEXCONT_HOME overrides data dir",
+                paths.user_data_dir() == custom_home,
+            )
+            check(
+                "paths: CODEXCONT_HOME config path",
+                paths.config_path() == custom_home / "config.toml",
+            )
+            os.environ.pop(ENV_HOME, None)
+
+        os.environ[ENV_CONFIG] = "/tmp/codexcont-custom.toml"
+        check(
+            "paths: CODEXCONT_CONFIG wins over mode",
+            paths.config_path() == Path("/tmp/codexcont-custom.toml").resolve(),
+        )
+        os.environ.pop(ENV_CONFIG, None)
+
+        example = paths.read_example_config()
+        check(
+            "paths: example config readable",
+            example is not None and "[server]" in example,
+        )
+        check(
+            "paths: example config path or bundle",
+            paths.example_config_path().exists() or example is not None,
+        )
+    finally:
+        if old_config is None:
+            os.environ.pop(ENV_CONFIG, None)
+        else:
+            os.environ[ENV_CONFIG] = old_config
+        if old_home is None:
+            os.environ.pop(ENV_HOME, None)
+        else:
+            os.environ[ENV_HOME] = old_home
+
+
 def test_models_endpoint():
     """GET /v1/models (and /v1/models/{id}, /health) must 200, not 404 --
     clients like Codex poll this and used to just get noisy 404s."""
@@ -1193,6 +1263,7 @@ async def _main():
     await test_forward_marker_emits_downstream()
     test_header_transparency()
     test_cli_toml_helpers()
+    test_paths_resolution()
     test_models_endpoint()
     test_upstream_url_resolution()
     test_auth_safety_guard()
