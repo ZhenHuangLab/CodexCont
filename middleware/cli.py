@@ -214,6 +214,12 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
+def _unsupported_proxy_scheme(url: str) -> bool:
+    """httpx only supports http/https/socks5/socks5h; Clash often sets ALL_PROXY=socks://…"""
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    return scheme not in ("", "http", "https", "socks5", "socks5h")
+
+
 def _spawn_env() -> dict[str, str]:
     env = os.environ.copy()
     env[ENV_CONFIG] = str(_config_path())
@@ -224,6 +230,13 @@ def _spawn_env() -> dict[str, str]:
         except json.JSONDecodeError:
             extra = {}
         env.update({str(k): str(v) for k, v in extra.items() if v})
+    else:
+        # Inherited ALL_PROXY=all_proxy (e.g. socks:// from Clash) breaks httpx startup
+        # even when CodexCont has no outbound proxy configured.
+        for key in ("all_proxy", "ALL_PROXY"):
+            val = env.get(key, "")
+            if val and _unsupported_proxy_scheme(val):
+                env.pop(key, None)
     return env
 
 
@@ -481,6 +494,8 @@ def _wizard_config(existing_cfg: bool, args: argparse.Namespace) -> str | None:
                     "https_proxy": proxy,
                     "HTTP_PROXY": proxy,
                     "HTTPS_PROXY": proxy,
+                    "all_proxy": proxy,
+                    "ALL_PROXY": proxy,
                 },
                 indent=2,
             )
