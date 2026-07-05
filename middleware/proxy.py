@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncGenerator, AsyncIterator, Iterator
 
 import httpx
 
@@ -294,7 +294,7 @@ async def fold_stream(
     first_response: httpx.Response,
     id_store: Any | None = None,
     url: str | None = None,
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
     against `url` (the resolved upstream, which may come from the

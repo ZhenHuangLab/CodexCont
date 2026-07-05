@@ -103,6 +103,9 @@ class FakeClient:
         self._i += 1
         return r
 
+    async def aclose(self) -> None:
+        pass
+
 
 async def run_fold(cfg, base_body, first_resp, later_resps) -> list:
     client = FakeClient(later_resps)
@@ -1012,6 +1015,171 @@ async def test_eof_incomplete():
     )
 
 
+# --- 8. WebSocket transport (bridges ws(s)://.../v1/responses to the same
+#        fold/passthrough pipeline the POST route uses) ---------------------
+
+
+def _ws_drain(ws, limit: int = 50) -> list[dict]:
+    """Receive WS JSON text frames until a terminal/error event (or a safety
+    cap, so a regression hangs the test instead of the whole suite)."""
+    evs: list[dict] = []
+    for _ in range(limit):
+        ev = json.loads(ws.receive_text())
+        evs.append(ev)
+        if ev.get("type") in (
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "error",
+        ):
+            break
+    return evs
+
+
+def test_ws_fold_roundtrip():
+    """A truncated round (516) folded with a clean round into ONE response.*
+    event stream over the WebSocket route, same behavior as the POST route."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    tool = {
+        "id": "fc_a",
+        "type": "function_call",
+        "name": "shell",
+        "call_id": "call_a",
+        "arguments": '{"cmd":"ls"}',
+    }
+    rA = FakeResp(_round("rs_a", "ENC_A", 516, extra_items=[tool]))
+    rB = FakeResp(_round("rs_b", "ENC_B", 999, msg="done"))
+
+    with TestClient(app) as client:
+        app.state.client = FakeClient([rA, rB])  # round 1, then the continuation
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "input": [{"role": "user", "content": "q"}],
+                    }
+                )
+            )
+            evs = _ws_drain(ws)
+
+    check(
+        "ws fold: terminal event type",
+        bool(evs) and evs[-1].get("type") == "response.completed",
+        str(evs[-1].get("type")) if evs else "no events",
+    )
+    has_fc = any((e.get("item") or {}).get("type") == "function_call" for e in evs)
+    check("ws fold: truncated tool call discarded", not has_fc)
+    deltas = "".join(
+        e.get("delta", "") for e in evs if e.get("type") == "response.output_text.delta"
+    )
+    check("ws fold: clean round message flushed", deltas == "done", deltas)
+    rounds = ((evs[-1].get("response") or {}).get("metadata") or {}).get("proxy_rounds")
+    check(
+        "ws fold: both rounds recorded in metadata",
+        rounds
+        == [
+            {"round": 1, "reasoning_tokens": 516, "n": 1},
+            {"round": 2, "reasoning_tokens": 999, "n": None},
+        ],
+        str(rounds),
+    )
+    check(
+        "ws fold: no error frame sent",
+        not any(e.get("type") == "error" for e in evs),
+    )
+
+
+def test_ws_passthrough():
+    """reasoning=false must skip folding entirely: events relayed unchanged,
+    with no renumbering and no continuation round opened."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    # reasoning_tokens matches the 518n-2 fingerprint on purpose: a
+    # non-reasoning request must never engage the fold regardless.
+    events = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_p", "status": "in_progress"},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "msg_p", "type": "message"},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_p",
+            "delta": "hi",
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_p",
+                "status": "completed",
+                "usage": {"output_tokens_details": {"reasoning_tokens": 516}},
+            },
+        },
+    ]
+    raw = make_sse(events)
+
+    with TestClient(app) as client:
+        app.state.client = FakeClient([FakeResp(raw)])  # exactly one round available
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "reasoning": False,
+                        "input": [{"role": "user", "content": "q"}],
+                    }
+                )
+            )
+            evs = _ws_drain(ws)
+
+    check("ws passthrough: events relayed unchanged", evs == events, str(evs))
+
+
+def test_ws_round1_error():
+    """A round-1 upstream 4xx must surface as one `{"type": "error", ...}`
+    frame (the shape Codex's WebSocket client parses) instead of a hang."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    err_body = json.dumps(
+        {"error": {"message": "invalid api key", "code": "invalid_api_key"}}
+    ).encode()
+
+    with TestClient(app) as client:
+        app.state.client = FakeClient([FakeResp(err_body, status=401)])
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "input": [{"role": "user", "content": "q"}],
+                    }
+                )
+            )
+            evs = _ws_drain(ws)
+
+    check("ws error: exactly one event", len(evs) == 1, str(evs))
+    ev = evs[0] if evs else {}
+    check("ws error: type=error", ev.get("type") == "error", str(ev.get("type")))
+    check("ws error: status echoed", ev.get("status") == 401, str(ev.get("status")))
+    err = ev.get("error") or {}
+    check(
+        "ws error: message/code extracted from upstream body",
+        err.get("message") == "invalid api key"
+        and err.get("code") == "invalid_api_key",
+        str(err),
+    )
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -1032,6 +1200,9 @@ async def _main():
     test_reasoning_gate()
     test_stateful_repair()
     await test_eof_incomplete()
+    test_ws_fold_roundtrip()
+    test_ws_passthrough()
+    test_ws_round1_error()
 
 
 def main():

@@ -2,7 +2,7 @@
 
 用于 Codex / OpenAI Responses 兼容 API 的“继续思考”中间件。
 
-本项目是一个轻量 Starlette 代理，部署在编码代理和上游 Responses 接口之间。它会检测一种已知的推理截断指纹：`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`。检测到后，中间件会在后台让模型继续思考，并把多轮上游流式响应折叠成一个连贯的下游 SSE 响应。
+本项目是一个轻量 Starlette 代理，部署在编码代理和上游 Responses 接口之间。它会检测一种已知的推理截断指纹：`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`。检测到后，中间件会在后台让模型继续思考，并把多轮上游流式响应折叠成一个连贯的下游响应。编码代理既可以用 HTTP（POST + SSE），也可以用 WebSocket 连接本代理；无论哪种方式，代理与上游之间始终是普通的 HTTP+SSE 请求。
 
 ```text
 编码代理  ->  CodexCont  ->  Codex / Responses API
@@ -21,6 +21,7 @@
 - 如果本轮被判定为截断，丢弃暂定输出，并携带已产生的 reasoning 打开下一轮续写请求。
 - 如果本轮自然完成或触发安全上限，冲刷最终一轮的输出，并发出一个重构后的 terminal response。
 - 对不符合条件的请求透明透传。
+- 同时接受来自编码代理的 HTTP（`POST /v1/responses`）和 WebSocket（`ws(s)://.../v1/responses`）连接 —— Codex（>= ~0.140）会优先尝试 WebSocket，如果代理不支持，每一轮都要重试好几次才会回退到 HTTP。
 - `GET /v1/models`（以及 `/v1/models/{id}`、`/health`）会返回一个占位模型列表而不是 404 —— Codex 等客户端会轮询这个接口。
 
 默认续写方式是隐藏的 `phase: "commentary"` assistant 消息（`"Continue thinking..."`）。也支持旧版的合成工具调用对（`tool_pair`）模式。
@@ -34,7 +35,7 @@
 
 - `httpx`
 - `starlette`
-- `uvicorn`
+- `uvicorn[standard]`（`standard` extra 会带上 `websockets`，下文的 WebSocket 路由需要它）
 
 ## 快速开始
 
@@ -46,7 +47,7 @@ uv run python run.py
 
 `run.py` 会读取本地 `config.toml`；请先从 `config.example.toml` 复制一份，再按需调整。
 
-示例默认服务监听 `127.0.0.1:8787`，接受以下路径的 POST 请求：
+示例默认服务监听 `127.0.0.1:8787`，在以下路径同时接受 POST 和 WebSocket 请求：
 
 - `/v1/responses`
 
@@ -106,6 +107,17 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 中间件会自动追加 `/responses`；如果传入值已经以 `/responses` 结尾，则保持不变。该控制头不会被继续转发到上游。
+
+## WebSocket 传输
+
+Codex（>= ~0.140，即 `responses_websockets` 特性）在回退到 HTTP 之前，会先尝试在 `ws(s)://.../v1/responses` 上进行 WebSocket 升级；如果代理不支持，每一轮都会先 405，Codex 要重试好几次才会回退（服务端日志里会看到 `Reconnecting... N/5`、`Unsupported upgrade request` 之类的噪音）。CodexCont 现在同时支持：
+
+- `POST /v1/responses` —— 原有的 HTTP + SSE 传输方式。
+- `ws(s)://.../v1/responses` —— 按照官方文档的 [WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode) 线上协议：客户端发送 `{"type": "response.create", ...body...}`，本代理以独立的 `response.*` 事件帧作答（如果某一轮压根打不开，则回一个 `{"type": "error", ...}` 事件）。
+
+不管代理用的是哪种传输方式，内部每一轮仍然是向上游发起一次普通的 HTTP+SSE 请求，并走同一套续写折叠逻辑。这里没有维护一个常驻的上游 WebSocket 连接，也没有基于连接的 `previous_response_id` 缓存，所以它带来的收益是“不再有回退噪音”，而不是真正端到端 WebSocket 才能带来的额外延迟优势；折叠的正确性在两种传输方式下完全一致。
+
+如果想禁用 WebSocket 路由、强制只用 HTTP（例如排查传输层问题时），在 `config.toml` 的 `[server]` 下设置 `enable_websocket = false` 即可。
 
 ## 鉴权
 
@@ -186,13 +198,14 @@ uv run python tests/test_middleware.py
 - 鉴权安全保护
 - EOF / 上游错误处理
 - `GET /v1/models`、`/v1/models/{id}`、`/health`
+- WebSocket 路由（折叠、透传、以及第一轮错误转发）
 - `codexcont` CLI 的 config.toml 文本编辑和 Codex `openai_base_url` 接入辅助函数
 
 ## 项目结构
 
 ```text
 middleware/
-  app.py       # Starlette 应用和路由处理
+  app.py       # Starlette 应用：HTTP（POST）和 WebSocket 路由处理
   cli.py       # `codexcont` CLI：引导式安装器 + 后台服务管理器
   codex.py     # 截断数学和续写 payload 构造
   config.py    # config.toml 加载和 dataclass 配置
@@ -216,6 +229,7 @@ config.example.toml # 示例运行配置；复制为 config.toml 后本地使用
 - 非流式请求当前会透传，不进行折叠。
 - 截断检测器是针对已观察到的 `518 * n - 2` 指纹设计的。
 - 可选的 `repair_followup = "stateful"` 使用进程内内存状态；多代理实例之间不会共享。
+- WebSocket 路由每一轮仍然是桥接到一次普通的 HTTP+SSE 上游请求；它不维护常驻的上游 WebSocket 连接，也没有基于连接的 `previous_response_id` 缓存，因此带来的是“不再有回退噪音”，而不是真正端到端 WebSocket 模式所承诺的额外延迟优势。
 
 ## 致谢
 

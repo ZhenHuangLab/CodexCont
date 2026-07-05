@@ -4,7 +4,7 @@
 
 Continue-thinking middleware for Codex / OpenAI Responses-compatible APIs.
 
-This project is a small Starlette proxy that sits between a coding agent and an upstream Responses endpoint. It detects a known reasoning-truncation fingerprint (`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`), silently asks the model to continue thinking, and folds multiple upstream streaming responses into one coherent downstream SSE response.
+This project is a small Starlette proxy that sits between a coding agent and an upstream Responses endpoint. It detects a known reasoning-truncation fingerprint (`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`), silently asks the model to continue thinking, and folds multiple upstream streaming responses into one coherent downstream response. The agent may speak either HTTP (POST + SSE) or WebSocket to the proxy; either way, the upstream leg is always a plain HTTP+SSE round.
 
 ```text
 Coding agent  ->  CodexCont  ->  Codex / Responses API
@@ -23,6 +23,7 @@ This project explicitly bypasses the observed OpenAI Codex reasoning-truncation 
 - If the round is truncated, discards the tentative output and opens a continuation round with the prior reasoning replayed.
 - If the round finishes cleanly or a safety cap is reached, flushes the final round output and emits one reconstructed terminal response.
 - Leaves non-matching traffic as a transparent passthrough.
+- Accepts either HTTP (`POST /v1/responses`) or WebSocket (`ws(s)://.../v1/responses`) from the agent -- Codex (>= ~0.140) tries WebSocket first and otherwise burns several retries falling back to HTTP on every turn.
 - Answers `GET /v1/models` (and `/v1/models/{id}`, `/health`) with a minimal placeholder list instead of 404, since several clients (Codex included) poll it.
 
 The default continuation method is a hidden `phase: "commentary"` assistant message (`"Continue thinking..."`). A legacy synthetic tool-pair mode is also available.
@@ -36,7 +37,7 @@ Runtime dependencies are declared in `pyproject.toml`:
 
 - `httpx`
 - `starlette`
-- `uvicorn`
+- `uvicorn[standard]` (the `standard` extra pulls in `websockets`, needed for the WebSocket route below)
 
 ## Quick start
 
@@ -48,7 +49,7 @@ uv run python run.py
 
 `run.py` reads the local `config.toml`; start by copying `config.example.toml` and then adjust it as needed.
 
-The example default server listens on `127.0.0.1:8787` and accepts POST requests at:
+The example default server listens on `127.0.0.1:8787` and accepts both POST and WebSocket requests at:
 
 - `/v1/responses`
 
@@ -112,6 +113,17 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 The middleware appends `/responses` unless the supplied value already ends with `/responses`. This control header is stripped before forwarding upstream.
+
+## WebSocket transport
+
+Codex (>= ~0.140, the `responses_websockets` feature) tries a WebSocket upgrade at `ws(s)://.../v1/responses` before falling back to HTTP; without WebSocket support a proxy 405s on every turn and Codex burns several retries before it falls back (visible as `Reconnecting... N/5` and `Unsupported upgrade request` noise in server logs). CodexCont answers both:
+
+- `POST /v1/responses` -- the original HTTP + SSE transport.
+- `ws(s)://.../v1/responses` -- speaks the documented [WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode) wire shape: the agent sends `{"type": "response.create", ...body...}`, the proxy answers with individual `response.*` event frames (or one `{"type": "error", ...}` frame if a round can't be opened at all).
+
+Internally, every turn -- regardless of which transport the agent used -- still opens one plain HTTP+SSE round upstream and runs it through the identical continuation-folding logic. There is no persistent upstream WebSocket connection and no connection-local `previous_response_id` cache, so this buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket bridge would; folding correctness is identical either way.
+
+Set `enable_websocket = false` under `[server]` in `config.toml` to disable the WebSocket route and force HTTP-only (e.g. while debugging transport issues).
 
 ## Authentication
 
@@ -192,13 +204,14 @@ Current offline coverage includes:
 - auth safety guard
 - EOF/upstream-error behavior
 - `GET /v1/models` / `/v1/models/{id}` / `/health`
+- the WebSocket route (fold, passthrough, and round-1-error relaying)
 - the `codexcont` CLI's config.toml text-surgery and Codex `openai_base_url` wiring helpers
 
 ## Project layout
 
 ```text
 middleware/
-  app.py       # Starlette app and route handler
+  app.py       # Starlette app: HTTP (POST) and WebSocket route handlers
   cli.py       # `codexcont` CLI: guided installer + background service manager
   codex.py     # truncation math and continuation payload builders
   config.py    # config.toml loader and dataclasses
@@ -222,6 +235,7 @@ config.example.toml # example runtime configuration; copy to config.toml for loc
 - Non-streaming requests are currently passed through rather than folded.
 - The truncation detector is intentionally specific to the observed `518 * n - 2` fingerprint.
 - Optional `repair_followup = "stateful"` uses in-memory process-local state; it is not shared across multiple proxy instances.
+- The WebSocket route bridges to a plain HTTP+SSE upstream round per turn; it keeps no persistent upstream WebSocket connection and no connection-local `previous_response_id` cache, so it buys "no fallback noise" rather than the extra latency win a true end-to-end WebSocket mode promises.
 
 ## Acknowledgements
 

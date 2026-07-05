@@ -10,13 +10,14 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .codex import (
     build_round_payload,
@@ -27,12 +28,17 @@ from .codex import (
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .proxy import fold_stream, open_passthrough, open_round
+from .sse import DONE, incremental_sse
 from .store import IdStore
 
 log = logging.getLogger("middleware.app")
 
+# An HTTP Request and a WebSocket handshake both expose a case-insensitive
+# `.headers` mapping, which is all the header-resolution helpers below need.
+HeaderSource = Request | WebSocket
 
-def _header_base(request: Request) -> str | None:
+
+def _header_base(request: HeaderSource) -> str | None:
     """The non-blank Responses-API-Base header value, or None (case-insensitive)."""
     v = request.headers.get("responses-api-base")
     v = v.strip() if v else ""
@@ -47,7 +53,7 @@ def _join_responses(base: str) -> str:
     return base if base.endswith("/responses") else base + "/responses"
 
 
-def _resolve_upstream_url(cfg: Config, request: Request) -> str | None:
+def _resolve_upstream_url(cfg: Config, request: HeaderSource) -> str | None:
     """Target URL for this request.
 
     - "fixed": always the configured URL (header ignored).
@@ -68,7 +74,7 @@ def _resolve_upstream_url(cfg: Config, request: Request) -> str | None:
     return cfg.upstream.url
 
 
-def _url_is_from_header(cfg: Config, request: Request) -> bool:
+def _url_is_from_header(cfg: Config, request: HeaderSource) -> bool:
     return (
         cfg.upstream.mode in ("header", "header_required")
         and _header_base(request) is not None
@@ -94,6 +100,33 @@ async def _passthrough(
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "text/event-stream"),
     )
+
+
+def _fold_decision(cfg: Config, body: dict[str, Any]) -> tuple[bool, str | None]:
+    """Whether this request should be folded, and if not, why -- shared by the
+    HTTP and WebSocket entry points (WebSocket callers force `stream=True` on
+    `body` beforehand, since the transport itself implies streaming)."""
+    collision = cfg.cont.method == "tool_pair" and declares_continue_tool(
+        body, cfg.cont.continue_tool_name
+    )
+    should_fold = (
+        cfg.cont.enabled
+        and bool(body.get("stream"))
+        and reasoning_enabled(body)
+        and not collision
+    )
+    if should_fold:
+        return True, None
+    why = (
+        "disabled"
+        if not cfg.cont.enabled
+        else "non-stream"
+        if not body.get("stream")
+        else "non-reasoning"
+        if not reasoning_enabled(body)
+        else "declares-continue_thinking"
+    )
+    return False, why
 
 
 async def handle_responses(request: Request) -> Response:
@@ -141,25 +174,8 @@ async def handle_responses(request: Request) -> Response:
     # the agent declaring its own continue_thinking) is a pure passthrough.
     # The collision rule only matters for the tool_pair method (we inject a tool);
     # commentary injects no tool, so a declared continue_thinking is irrelevant.
-    collision = cfg.cont.method == "tool_pair" and declares_continue_tool(
-        body, cfg.cont.continue_tool_name
-    )
-    should_fold = (
-        cfg.cont.enabled
-        and bool(body.get("stream"))
-        and reasoning_enabled(body)
-        and not collision
-    )
+    should_fold, why = _fold_decision(cfg, body)
     if not should_fold:
-        why = (
-            "disabled"
-            if not cfg.cont.enabled
-            else "non-stream"
-            if not body.get("stream")
-            else "non-reasoning"
-            if not reasoning_enabled(body)
-            else "declares-continue_thinking"
-        )
         log.info(
             "passthrough (%s): model=%s path=%s url=%s",
             why,
@@ -216,6 +232,185 @@ async def handle_responses(request: Request) -> Response:
         ),
         media_type="text/event-stream",
     )
+
+
+# --- WebSocket transport -----------------------------------------------------
+#
+# Codex (>= ~0.140, the "responses_websockets" feature) tries a WebSocket
+# upgrade at `ws(s)://.../v1/responses` before falling back to HTTP; without a
+# route here every turn 405s (uvicorn doesn't even attempt the upgrade without
+# a websockets/wsproto library + a WebSocketRoute) and Codex burns several
+# retries before it falls back. We speak the documented wire shape -- client
+# sends `{"type": "response.create", ...body...}`, server answers with
+# individual `response.*` event frames, see
+# https://developers.openai.com/api/docs/guides/websocket-mode -- but
+# internally still open one plain HTTP+SSE round per turn upstream, reusing
+# the exact same fold/passthrough logic as the POST route. There is no
+# persistent upstream WebSocket or connection-local `previous_response_id`
+# cache, so this buys "no fallback noise", not the extra latency win a true
+# end-to-end WebSocket bridge would.
+
+
+def _ws_error_event(
+    status: int, message: str, *, code: str | None = None
+) -> dict[str, Any]:
+    """`{"type": "error", ...}` in the shape Codex's WebSocket client parses
+    (status + error.message/.code), used when a round can't be opened at all
+    (mirrors what an HTTP 4xx/5xx response would carry on the POST route)."""
+    err: dict[str, Any] = {"message": message}
+    if code:
+        err["code"] = code
+    return {"type": "error", "status": status, "error": err}
+
+
+def _upstream_error_message(raw: bytes) -> tuple[str, str | None]:
+    """Best-effort (message, code) pulled from an upstream JSON error body."""
+    text = raw[:2000].decode("utf-8", errors="replace")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text, None
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict) and isinstance(err.get("message"), str):
+        code = err.get("code")
+        return err["message"], code if isinstance(code, str) else None
+    return text, None
+
+
+async def _events_from_byte_stream(
+    byte_iter: AsyncGenerator[bytes, None],
+) -> AsyncGenerator[Any, None]:
+    """`incremental_sse`, but guarantees `byte_iter.aclose()` runs even if the
+    consumer stops iterating early (the agent disconnects mid-round), so
+    `fold_stream`'s `finally: await response.aclose()` still fires instead of
+    leaking the upstream connection."""
+    async with contextlib.aclosing(byte_iter):
+        async for ev in incremental_sse(byte_iter):
+            yield ev
+
+
+async def _ws_open_events(
+    client: httpx.AsyncClient, url: str, body: dict[str, Any], headers: dict[str, str]
+) -> AsyncGenerator[Any, None]:
+    """Open one non-folding upstream round for a WebSocket turn and yield its
+    parsed events (or a single `error` event if the round can't be opened)."""
+    resp = await open_round(client, url, body, headers)
+    try:
+        if resp.status_code >= 400:
+            message, code = _upstream_error_message(await resp.aread())
+            yield _ws_error_event(resp.status_code, message, code=code)
+            return
+        async for ev in incremental_sse(resp.aiter_bytes()):
+            if ev is not DONE:
+                yield ev
+    finally:
+        await resp.aclose()
+
+
+async def _handle_response_create(
+    websocket: WebSocket,
+    cfg: Config,
+    client: httpx.AsyncClient,
+    id_store: Any,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    url: str,
+) -> None:
+    """Run one `response.create` turn to completion, relaying `response.*` (or
+    a single `error`) event as individual WebSocket JSON text frames."""
+    should_fold, why = _fold_decision(cfg, body)
+    log.info(
+        "ws %s: model=%s url=%s input_items=%d",
+        "fold start" if should_fold else f"passthrough ({why})",
+        body.get("model"),
+        url,
+        len(body.get("input") or []),
+    )
+
+    if should_fold:
+        resp = await open_round(client, url, body, headers)
+        if resp.status_code >= 400:
+            message, code = _upstream_error_message(await resp.aread())
+            await resp.aclose()
+            await websocket.send_text(
+                json.dumps(_ws_error_event(resp.status_code, message, code=code))
+            )
+            return
+        event_source = _events_from_byte_stream(
+            fold_stream(client, cfg, body, headers, resp, id_store, url=url)
+        )
+    else:
+        event_source = _ws_open_events(client, url, body, headers)
+
+    async with contextlib.aclosing(event_source) as events:
+        async for ev in events:
+            if ev is DONE or not isinstance(ev, dict):
+                continue
+            await websocket.send_text(json.dumps(ev, ensure_ascii=False))
+
+
+async def handle_responses_ws(websocket: WebSocket) -> None:
+    """WebSocket counterpart of `handle_responses`; see the module note above."""
+    cfg: Config = websocket.app.state.cfg
+    client: httpx.AsyncClient = websocket.app.state.client
+    id_store = websocket.app.state.id_store
+
+    url = _resolve_upstream_url(cfg, websocket)
+    if url is None:
+        await websocket.close(code=1008)  # header_required, header missing/blank
+        return
+    if _url_is_from_header(cfg, websocket) and would_inject_authorization(
+        cfg, agent_has_authorization=websocket.headers.get("authorization") is not None
+    ):
+        log.warning("ws blocked: Responses-API-Base override without own auth")
+        await websocket.close(code=1008)
+        return
+
+    # openai-beta advertises WebSocket support to whatever it's sent to; strip
+    # it before forwarding since the round we open upstream is always plain
+    # SSE, never a WS upgrade.
+    headers = build_upstream_headers(
+        ((k, v) for k, v in websocket.headers.items() if k.lower() != "openai-beta"),
+        cfg,
+    )
+
+    await websocket.accept()
+    try:
+        while True:
+            raw_msg = await websocket.receive_text()
+            try:
+                envelope = json.loads(raw_msg)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                await websocket.send_text(
+                    json.dumps(_ws_error_event(400, "invalid JSON body"))
+                )
+                continue
+            if not isinstance(envelope, dict):
+                await websocket.send_text(
+                    json.dumps(_ws_error_event(400, "body must be a JSON object"))
+                )
+                continue
+            if envelope.get("type") != "response.create":
+                log.info("ws: ignoring frame type=%s", envelope.get("type"))
+                continue
+
+            body = {k: v for k, v in envelope.items() if k != "type"}
+            body["stream"] = True  # implied by the transport; Codex never sends it here
+
+            try:
+                await _handle_response_create(
+                    websocket, cfg, client, id_store, body, headers, url
+                )
+            except (httpx.HTTPError, ConnectionError) as exc:
+                log.warning("ws: round failed to open: %r", exc)
+                message = str(exc) or repr(exc)
+                await websocket.send_text(
+                    json.dumps(
+                        _ws_error_event(502, f"upstream connection error: {message}")
+                    )
+                )
+    except WebSocketDisconnect:
+        pass
 
 
 def _model_object(model_id: str, owned_by: str) -> dict[str, Any]:
@@ -279,6 +474,11 @@ def create_app(cfg: Config) -> Starlette:
         Route(path, handle_responses, methods=["POST"])
         for path in cfg.server.listen_paths
     ]
+    if cfg.server.enable_websocket:
+        routes += [
+            WebSocketRoute(path, handle_responses_ws)
+            for path in cfg.server.listen_paths
+        ]
     routes += [
         Route("/v1/models", handle_models, methods=["GET"]),
         Route("/v1/models/{model_id:path}", handle_model, methods=["GET"]),

@@ -550,6 +550,7 @@ create in the `RESTORE.md` manifest from §3.5 so it can be removed on uninstall
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `curl` to `/v1/responses` → connection refused | Proxy not running / wrong port | Start it (§6); confirm `[server].port`; check nothing else owns 8787. |
+| Client repeatedly logs `GET /v1/responses` → `405`, proxy log shows `Unsupported upgrade request` / `No supported WebSocket library detected` | Client (Codex >= ~0.140) tries a WebSocket upgrade at `ws(s)://.../v1/responses` before HTTP; an old CodexCont checkout only implements the POST route, and uvicorn has no `websockets`/`wsproto` installed | Update CodexCont (adds a WebSocket route) and re-run `uv sync` (pulls in `uvicorn[standard]`/`websockets`), then restart the proxy. `[server].enable_websocket = false` forces HTTP-only as a last-resort workaround. |
 | Agent: 404 / "unknown endpoint" / empty stream | Client not using the Responses wire protocol | Codex: `wire_api = "responses"`. Pi: `"api": "openai-responses"`. |
 | Agent: `401` | Upstream auth missing/invalid | In `passthrough`, the agent's own login must be valid. In `inject`, set a correct `access_token` (+ `chatgpt_account_id`) in `config.toml`. |
 | Proxy returns `400` on per-request override | Credential-leak guard: a `Responses-API-Base` was sent while config would inject creds | Use `passthrough`/`passthrough_then_inject` and let the caller send its own `Authorization`. |

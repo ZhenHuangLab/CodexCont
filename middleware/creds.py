@@ -25,6 +25,14 @@ _CLIENT_OWNED = {
     "proxy-connection",
     "transfer-encoding",
     "accept-encoding",
+    # WebSocket handshake-only headers: meaningless on the plain HTTP round we
+    # always speak upstream, even when the downstream leg was a WebSocket
+    # connection (see app.py's handle_responses_ws).
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
 }
 
 _AUTH = "authorization"

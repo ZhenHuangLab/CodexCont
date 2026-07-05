@@ -20,6 +20,10 @@ class ServerCfg:
         "/backend-api/codex/responses",
         "/v1/responses",
     )
+    # Mount a WebSocketRoute alongside the POST route on every listen_paths
+    # entry. Codex (>= ~0.140) tries `ws(s)://.../v1/responses` before HTTP;
+    # set false to force HTTP-only (e.g. while debugging transport issues).
+    enable_websocket: bool = True
 
 
 @dataclass(frozen=True)
