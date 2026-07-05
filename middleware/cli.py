@@ -533,10 +533,36 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not CONFIG_PATH.exists():
         print("No config.toml was written; re-run `codexcont install` to create one.")
         return 0
+
     if args.yes or _ask_yes_no("Start CodexCont now in the background?", default=True):
-        return cmd_start(argparse.Namespace(foreground=False))
-    print("Start it later with `codexcont start` (or just `codexcont` for the menu).")
-    return 0
+        rc = cmd_start(argparse.Namespace(foreground=False))
+    else:
+        print(
+            "Start it later with `codexcont start` (or just `codexcont` for the menu)."
+        )
+        rc = 0
+
+    print(
+        "\nNext step -- point a coding agent at the proxy (nothing else was changed yet):"
+    )
+    if CODEX_CONFIG.exists():
+        print(
+            "  - Codex CLI detected: run `codexcont wire-codex` to point its built-in"
+        )
+        print("    `openai` provider at this proxy. A backup is made first, and")
+        print("    `codexcont unwire-codex` reverts it.")
+    else:
+        print(
+            "  - Codex CLI: once it's installed, run `codexcont wire-codex` to point it"
+        )
+        print("    at this proxy (`codexcont unwire-codex` reverts it).")
+    print(
+        "  - Any other coding agent, or to review the change before applying it: hand"
+    )
+    print(
+        "    INSTALL-GUIDE-AGENT/AGENT.md to your coding agent for a guided, backed-up wiring."
+    )
+    return rc
 
 
 # --- Codex CLI wiring (opt-in, explicit; openai_base_url only) --------------
