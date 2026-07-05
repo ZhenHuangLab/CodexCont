@@ -40,7 +40,6 @@ from . import paths
 from .paths import ENV_CONFIG
 
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
-BACKUP_ROOT = Path.home() / ".codexcont-backup"
 WIRE_MARKER = "# codexcont-managed: openai_base_url (added by `codexcont wire-codex`)"
 SERVER_CMD = [sys.executable, "-m", "middleware.server"]
 
@@ -99,9 +98,9 @@ def _now() -> str:
 
 
 def _backup_file(path: Path, name: str) -> Path:
-    backup_dir = BACKUP_ROOT / time.strftime("%Y%m%d-%H%M%S")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    dest = backup_dir / name
+    dest_dir = paths.backup_dir() / time.strftime("%Y%m%d-%H%M%S")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / name
     dest.write_bytes(path.read_bytes())
     return dest
 

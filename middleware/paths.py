@@ -36,6 +36,10 @@ def state_dir() -> Path:
     return user_data_dir()
 
 
+def backup_dir() -> Path:
+    return user_data_dir() / "backup"
+
+
 def example_config_path() -> Path:
     repo_example = PACKAGE_ROOT / "config.example.toml"
     if repo_example.exists():

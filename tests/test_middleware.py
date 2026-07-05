@@ -705,7 +705,17 @@ def test_paths_resolution():
                 "paths: CODEXCONT_HOME config path",
                 paths.config_path() == custom_home / "config.toml",
             )
+            check(
+                "paths: CODEXCONT_HOME backup dir",
+                paths.backup_dir() == custom_home / "backup",
+            )
             os.environ.pop(ENV_HOME, None)
+
+        with patch("middleware.paths.is_dev_checkout", return_value=False):
+            check(
+                "paths: installed backup in ~/.codexcont/backup",
+                paths.backup_dir() == Path.home() / ".codexcont" / "backup",
+            )
 
         os.environ[ENV_CONFIG] = "/tmp/codexcont-custom.toml"
         check(

@@ -39,7 +39,7 @@ pointed at it instead of at the real upstream.
    the uv cache.
 7. **Leftovers from a previous attempt are common.** Before assuming a clean slate, run the
    pre-check in §2. A stray `[model_providers.codexcont]` block, an old
-   `~/.codexcont-backup/` dir, or a process still holding the port will make later steps
+   `~/.codexcont/backup/` dir, or a process still holding the port will make later steps
    behave unexpectedly if you don't account for them first.
 
 ---
@@ -88,7 +88,7 @@ install Python 3.12+ (or point you at an existing one).
 and can confuse later diagnosis if you don't know about them upfront:
 
 ```bash
-ls -la ~/.codexcont-backup/ 2>/dev/null              # old backups not cleaned up?
+ls -la ~/.codexcont/backup/ 2>/dev/null              # old backups not cleaned up?
 grep -n "^openai_base_url\|^model_provider\|\[model_providers\." ~/.codex/config.toml 2>/dev/null  # stray wiring already present?
 lsof -i :8787                                         # default port already occupied?
 ```
@@ -153,8 +153,8 @@ You must be able to fully restore the user's setup later (see §10). Create a ba
 ```bash
 # Pick a timestamped backup dir outside the repo:
 TS=$(date +%Y%m%d-%H%M%S)
-BACKUP="$HOME/.codexcont-backup/$TS"      # works in Git Bash, macOS, Linux
-#   Windows note: $HOME maps to %USERPROFILE%; in PowerShell use $env:USERPROFILE\.codexcont-backup\<TS>
+BACKUP="$HOME/.codexcont/backup/$TS"      # works in Git Bash, macOS, Linux
+#   Windows note: $HOME maps to %USERPROFILE%; in PowerShell use $env:USERPROFILE\.codexcont\backup\<TS>
 mkdir -p "$BACKUP"
 
 # Copy only the configs you intend to touch (only those the user chose in §3.2):
