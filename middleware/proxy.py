@@ -653,7 +653,7 @@ async def fold_stream(
                 yield serialize_done()
             return
 
-    except (httpx.HTTPError, ConnectionError) as exc:
+    except (httpx.HTTPError, OSError) as exc:
         log.warning("upstream error mid-stream (round %d): %r", round_no, exc)
         log.info(
             "done: %d round(s) | %s | status=incomplete stop=upstream_error",

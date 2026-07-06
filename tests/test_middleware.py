@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -1410,6 +1411,69 @@ def test_ws_round1_error():
     )
 
 
+def test_ws_ssl_error_survives():
+    """A raw ssl.SSLError from the upstream socket (a corrupted proxy tunnel ->
+    bad_record_mac) is neither httpx.HTTPError nor ConnectionError; it must
+    still surface as one `error` frame and leave the WS session usable for a
+    retry instead of crashing the handler."""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+
+    ok_events = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_s", "status": "in_progress"},
+        },
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_s", "status": "completed", "usage": {}},
+        },
+    ]
+
+    class _SSLThenOK(FakeClient):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.raised = False
+
+        async def send(self, req, stream=True):
+            if not self.raised:
+                self.raised = True
+                raise ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac")
+            return await super().send(req, stream)
+
+    frame = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.5",
+            "reasoning": False,
+            "input": [{"role": "user", "content": "q"}],
+        }
+    )
+    with TestClient(app) as client:
+        app.state.client = _SSLThenOK([FakeResp(make_sse(ok_events))])
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_text(frame)
+            evs1 = _ws_drain(ws)
+            ws.send_text(frame)  # session must have survived the SSLError
+            evs2 = _ws_drain(ws)
+
+    check(
+        "ws ssl error: one error frame",
+        len(evs1) == 1 and evs1[0].get("type") == "error",
+        str(evs1),
+    )
+    check(
+        "ws ssl error: status 502",
+        bool(evs1) and evs1[0].get("status") == 502,
+        str(evs1),
+    )
+    check(
+        "ws ssl error: session survives, retry completes",
+        bool(evs2) and evs2[-1].get("type") == "response.completed",
+        str(evs2),
+    )
+
+
 def test_ws_previous_response_id_chain():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
@@ -1673,6 +1737,7 @@ async def _main():
     test_ws_fold_roundtrip()
     test_ws_passthrough()
     test_ws_round1_error()
+    test_ws_ssl_error_survives()
     test_ws_previous_response_id_chain()
     test_ws_passthrough_chain_recorded()
     test_http_passthrough_chain_recorded()

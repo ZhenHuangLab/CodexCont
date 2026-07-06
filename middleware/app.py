@@ -554,7 +554,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 await _handle_response_create(
                     websocket, cfg, client, id_store, chain_store, body, headers, url
                 )
-            except (httpx.HTTPError, ConnectionError) as exc:
+            except (httpx.HTTPError, OSError) as exc:
                 log.warning("ws: round failed to open: %r", exc)
                 message = str(exc) or repr(exc)
                 await websocket.send_text(
