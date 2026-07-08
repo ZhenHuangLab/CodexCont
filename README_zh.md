@@ -39,50 +39,34 @@
 
 ## 快速开始
 
-```bash
-uv sync
-cp config.example.toml config.toml
-uv run python run.py
-```
+### 一条命令
 
-`run.py` 会读取本地 `config.toml`；请先从 `config.example.toml` 复制一份，再按需调整。
-
-示例默认服务监听 `127.0.0.1:8787`，在以下路径同时接受 POST 和 WebSocket 请求：
-
-- `/v1/responses`
-
-也可以直接使用当前虚拟环境运行：
+安装并运行 CLI（无需克隆仓库）：
 
 ```bash
-# Windows / 本工作区 Git Bash
-.venv/Scripts/python.exe run.py
+uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont
 ```
 
-### 一键替代方案：`codexcont` 命令行工具
-
-内置的 CLI 把上面这些步骤包装成了一个引导式安装器 + 后台服务管理器：安装或写入 `config.toml` 前都会先询问确认，随时可以启动/停止代理、查看日志：
+### 从源码安装
 
 ```bash
-./codexcont install   # 先确认，再交互式安装依赖 + 写入 config.toml
-./codexcont start     # 在后台启动代理
-./codexcont logs -f   # 跟随查看日志（Ctrl+C 停止跟随）
-./codexcont stop      # 停止代理
-./codexcont           # 交互式菜单 —— 无需记忆参数
+git clone https://github.com/ZhenHuangLab/CodexCont.git
+cd CodexCont
 ```
 
-也可以用 `uv` 直接运行：`uv run codexcont install`；或者不克隆仓库，直接用
-`uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont`。Windows 上用
-`codexcont.bat` 代替 `./codexcont`。运行 `./codexcont --help` 查看全部子命令，包括
-`wire-codex` / `unwire-codex`（通过顶层的 `openai_base_url` 配置项把 Codex CLI 内置
-provider 指向本代理 —— 不切换 `model_provider`，会话历史依旧可见）。
 
-通过 `uvx` 或 `pip` 安装（非 git clone）时，`config.toml` 默认在 `~/.codexcont/config.toml`，
-日志和 pid 文件也在该目录。可用 `CODEXCONT_CONFIG` 指定配置文件路径，或 `CODEXCONT_HOME`
-指定数据目录。git clone 本地开发仍在仓库根目录读写 `config.toml`。
+```bash
+./codexcont install   # 交互式写入 ~/.codexcont/config.toml
+./codexcont start       # 代理地址 http://127.0.0.1:8787/v1/responses
+```
 
-这个 CLI 只管理 CodexCont 自身（依赖、`config.toml`、服务进程）；除 `wire-codex` 外不会
-自动修改其他工具的配置。如果需要为任意编码 Agent 做一次完整的、带备份的接入引导，请把
-[`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md) 交给一个 AI Agent 执行。
+其他常用命令：`./codexcont logs -f`、`./codexcont stop`、`./codexcont wire-codex`（将 Codex 指向该代理）。运行 `./codexcont --help` 查看完整命令列表。
+
+或使用 `uv`：
+
+```bash
+uv sync && cp config.example.toml config.toml && uv run python run.py
+```
 
 ## 将客户端指向代理
 

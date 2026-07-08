@@ -41,55 +41,34 @@ Runtime dependencies are declared in `pyproject.toml`:
 
 ## Quick start
 
-```bash
-uv sync
-cp config.example.toml config.toml
-uv run python run.py
-```
+### One command
 
-`run.py` reads the local `config.toml`; start by copying `config.example.toml` and then adjust it as needed.
-
-The example default server listens on `127.0.0.1:8787` and accepts both POST and WebSocket requests at:
-
-- `/v1/responses`
-
-You can also run with the already-created virtual environment directly:
+Install and run the CLI (no clone required):
 
 ```bash
-# Windows / Git Bash in this workspace
-.venv/Scripts/python.exe run.py
+uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont
 ```
 
-### One-click alternative: the `codexcont` CLI
-
-A bundled CLI wraps the steps above into a guided installer plus a background service
-manager. It asks for confirmation before installing or writing `config.toml`, and lets you
-start/stop the proxy and view its logs at any time:
+### From source
 
 ```bash
-./codexcont install   # confirms, then installs deps + writes config.toml interactively
-./codexcont start     # start the proxy in the background
-./codexcont logs -f   # follow its logs (Ctrl+C to stop following)
-./codexcont stop      # stop it
-./codexcont           # interactive menu -- same actions, no flags to remember
+git clone https://github.com/ZhenHuangLab/CodexCont.git
+cd CodexCont
 ```
 
-`uv`-based equivalents also work: `uv run codexcont install`, or, without cloning the repo,
-`uvx --from git+https://github.com/ZhenHuangLab/CodexCont codexcont`. On Windows, use
-`codexcont.bat` in place of `./codexcont`. Run `./codexcont --help` for every subcommand,
-including `wire-codex` / `unwire-codex` (points the Codex CLI's built-in provider at this
-proxy via the top-level `openai_base_url` key -- no `model_provider` switch, so conversation
-history stays visible).
 
-When installed via `uvx` or `pip` (not a git clone), `config.toml` lives at
-`~/.codexcont/config.toml` by default; logs and the pid file use the same directory. Override
-with `CODEXCONT_CONFIG` (full path to the config file) or `CODEXCONT_HOME` (data directory).
-A git clone keeps using `config.toml` in the repo root.
+```bash
+./codexcont install   # writes ~/.codexcont/config.toml interactively
+./codexcont start       # proxy at http://127.0.0.1:8787/v1/responses
+```
 
-This CLI only manages CodexCont itself (dependencies, `config.toml`, the server process); it
-doesn't edit other tools' configs on its own (`wire-codex` aside). For a fully guided,
-backed-up wiring of any coding agent, hand an AI agent
-[`INSTALL-GUIDE-AGENT/AGENT.md`](INSTALL-GUIDE-AGENT/AGENT.md).
+Other useful commands: `./codexcont logs -f`, `./codexcont stop`, `./codexcont wire-codex` (point Codex at the proxy). Run `./codexcont --help` for the full list.
+
+Or use `uv`:
+
+```bash
+uv sync && cp config.example.toml config.toml && uv run python run.py
+```
 
 ## Point your client at the proxy
 
