@@ -331,6 +331,111 @@ async def handle_responses(request: Request) -> Response:
     )
 
 
+def _record_compact_json(chain_store: Any, raw: bytes) -> None:
+    """A non-streamed compact response is one JSON Response object whose
+    `output` is the replacement history; map its id to that output so a later
+    turn chaining off it via `previous_response_id` still resolves."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    rid, output = data.get("id"), data.get("output")
+    if rid and isinstance(rid, str) and isinstance(output, list):
+        chain_store.set(rid, output)
+
+
+async def handle_responses_compact(request: Request) -> Response:
+    """POST <listen_path>/compact -- server-side context compaction
+    (`/v1/responses/compact`), forwarded with /responses-grade streaming.
+
+    Compaction is a full generation call: upstream sends nothing while the
+    model summarizes the whole transcript, routinely longer than the 60s the
+    buffered /v1 catch-all tolerates (Codex auto-compaction through this
+    proxy surfaced as a mid-session 502) -- and under a non-/v1 listen prefix
+    (/backend-api/codex/responses) that catch-all does not even match. Fold
+    logic never applies here: the result is a replacement history, not an
+    answer to continue.
+
+    The response id maps to its `output` ALONE in the chain store --
+    compaction REPLACES history, so a client chaining its next turn off that
+    id must get exactly the compacted items and nothing older. Codex itself
+    does not chain here (it rebuilds the next turn's input from the
+    replacement history client-side, and its WS incremental mode falls back
+    to a full request when items don't prefix-match); this is a safety net
+    for other stateful clients.
+    """
+    cfg: Config = request.app.state.cfg
+    client: httpx.AsyncClient = request.app.state.client
+    chain_store = request.app.state.chain_store
+
+    raw = await request.body()
+    try:
+        raw = _decompress_body(raw, request.headers.get("content-encoding"))
+    except ValueError as exc:
+        return JSONResponse({"error": f"invalid request body: {exc}"}, status_code=400)
+
+    url = _resolve_upstream_url(cfg, request)
+    if url is None:
+        return JSONResponse(
+            {
+                "error": "Responses-API-Base header is required (upstream mode=header_required)"
+            },
+            status_code=400,
+        )
+    if _url_is_from_header(cfg, request) and would_inject_authorization(
+        cfg, agent_has_authorization=request.headers.get("authorization") is not None
+    ):
+        log.warning("blocked: compact with Responses-API-Base override without own auth")
+        return JSONResponse(
+            {
+                "error": "When overriding the upstream base (Responses-API-Base), the request must "
+                "provide its own Authorization; the proxy will not send its configured "
+                "credentials to an externally supplied URL."
+            },
+            status_code=400,
+        )
+
+    target = url + "/compact"
+    log.info("compact passthrough: path=%s url=%s", request.url.path, target)
+    headers = build_upstream_headers(request.headers.items(), cfg)
+    try:
+        resp = await open_passthrough(client, target, raw, headers)
+    except httpx.HTTPError as exc:
+        return JSONResponse({"error": f"upstream error: {exc}"}, status_code=502)
+
+    content_type = resp.headers.get("content-type", "application/json")
+    # A streamed compaction (stream=true) records through the SSE recorder;
+    # the plain-JSON shape is buffered (one small summary object) and
+    # recorded once fully relayed.
+    recorder = _ChainRecorder(chain_store, [])
+    acc = SSEAccumulator()
+    json_buf: bytearray | None = (
+        bytearray()
+        if resp.status_code < 400 and "text/event-stream" not in content_type
+        else None
+    )
+
+    async def body_iter():
+        try:
+            async for chunk in resp.aiter_bytes():
+                if json_buf is None:
+                    for ev in acc.feed(chunk):
+                        recorder.observe(ev)
+                else:
+                    json_buf.extend(chunk)
+                yield chunk
+        finally:
+            await resp.aclose()
+            if json_buf is not None:
+                _record_compact_json(chain_store, bytes(json_buf))
+
+    return StreamingResponse(
+        body_iter(), status_code=resp.status_code, media_type=content_type
+    )
+
+
 # --- WebSocket transport -----------------------------------------------------
 #
 # Codex (>= ~0.140, the "responses_websockets" feature) tries a WebSocket
@@ -690,6 +795,13 @@ def create_app(cfg: Config) -> Starlette:
 
     routes = [
         Route(path, handle_responses, methods=["POST"])
+        for path in cfg.server.listen_paths
+    ]
+    # Server-side compaction lives one segment under every listen path; it
+    # needs /responses-grade streaming + timeout, not the buffered 60s /v1
+    # catch-all (and non-/v1 prefixes have no catch-all at all).
+    routes += [
+        Route(f"{path}/compact", handle_responses_compact, methods=["POST"])
         for path in cfg.server.listen_paths
     ]
     if cfg.server.enable_websocket:

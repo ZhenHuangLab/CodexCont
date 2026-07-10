@@ -92,8 +92,11 @@ class FakeClient:
         self._responses = list(responses)
         self._i = 0
         self.payloads: list[dict] = []
+        self.urls: list[str] = []
 
     def build_request(self, *a, **k):
+        if len(a) > 1:
+            self.urls.append(a[1])
         content = k.get("content")
         if content is not None:
             try:
@@ -847,6 +850,94 @@ def test_v1_catchall_passthrough():
             "v1 catch-all: path + query forwarded to upstream base",
             called.endswith("/some/unknown/endpoint?limit=5"),
             called,
+        )
+
+
+def test_compact_passthrough():
+    """POST <listen_path>/compact must ride the /responses-grade streaming
+    passthrough (not the buffered 60s /v1 catch-all, which 502'd real
+    compactions) on EVERY listen prefix, and record id -> output (the
+    replacement history, nothing older) in the chain store."""
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(
+        base,
+        server=replace(
+            base.server,
+            listen_paths=("/backend-api/codex/responses", "/v1/responses"),
+        ),
+    )
+    app = create_app(cfg)
+    compact = {
+        "id": "resp_compact1",
+        "object": "response",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "summary"}],
+            }
+        ],
+    }
+    body = {
+        "model": "gpt-5.3-codex",
+        "input": [{"type": "message", "role": "user", "content": []}],
+    }
+    with TestClient(app) as client:
+        fake = FakeClient([FakeResp(json.dumps(compact).encode())])
+        app.state.client = fake
+        r = client.post("/v1/responses/compact", json=body)
+        check("compact: 200", r.status_code == 200, str(r.status_code))
+        check(
+            "compact: body relayed",
+            r.json().get("id") == "resp_compact1",
+            r.text[:80],
+        )
+        check(
+            "compact: forwarded to <base>/responses/compact",
+            bool(fake.urls) and fake.urls[-1].endswith("/responses/compact"),
+            str(fake.urls),
+        )
+        check(
+            "compact: request body forwarded unmodified",
+            bool(fake.payloads) and fake.payloads[-1] == body,
+            str(fake.payloads[-1:])[:120],
+        )
+        check(
+            "compact: chain store maps id -> output alone",
+            app.state.chain_store.get("resp_compact1") == compact["output"],
+            str(app.state.chain_store.get("resp_compact1"))[:120],
+        )
+
+        # non-/v1 listen prefix (chatgpt_base_url wiring) -- previously a 404
+        app.state.client = FakeClient([FakeResp(json.dumps(compact).encode())])
+        r2 = client.post("/backend-api/codex/responses/compact", json=body)
+        check(
+            "compact: non-/v1 listen prefix routes too",
+            r2.status_code == 200,
+            str(r2.status_code),
+        )
+
+        # streamed compaction (stream=true): recorded via the SSE recorder
+        sse_events = [
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "message", "id": "m1"},
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_compact_sse", "output": []},
+            },
+        ]
+        sse_resp = FakeResp(make_sse(sse_events))
+        sse_resp.headers = {"content-type": "text/event-stream"}
+        app.state.client = FakeClient([sse_resp])
+        r3 = client.post("/v1/responses/compact", json=body)
+        check("compact SSE: 200", r3.status_code == 200, str(r3.status_code))
+        check(
+            "compact SSE: chain recorded from stream terminal",
+            app.state.chain_store.get("resp_compact_sse")
+            == [{"type": "message", "id": "m1"}],
+            str(app.state.chain_store.get("resp_compact_sse"))[:120],
         )
 
 
@@ -1727,6 +1818,7 @@ async def _main():
     test_paths_resolution()
     test_models_endpoint()
     test_v1_catchall_passthrough()
+    test_compact_passthrough()
     test_upstream_url_resolution()
     test_auth_safety_guard()
     test_auth_injection()

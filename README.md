@@ -26,7 +26,8 @@ This project explicitly bypasses the observed OpenAI Codex reasoning-truncation 
 - If the round finishes cleanly or a safety cap is reached, flushes the final round output and emits one reconstructed terminal response.
 - Leaves non-matching traffic as a transparent passthrough.
 - Accepts either HTTP (`POST /v1/responses`) or WebSocket (`ws(s)://.../v1/responses`) from the agent -- Codex (>= ~0.140) tries WebSocket first and otherwise burns several retries falling back to HTTP on every turn.
-- Answers `GET /v1/models` (and `/v1/models/{id}`, `/health`) with a minimal placeholder list instead of 404, since several clients (Codex included) poll it.
+- Forwards server-side context compaction (`POST /v1/responses/compact`, used by Codex auto-compaction) as a streaming passthrough with the same generous timeout as `/responses` -- a compaction routinely thinks for over a minute, which would 502 through a plain buffered proxy hop.
+- Answers `GET /v1/models` (and `/v1/models/{id}`, `/health`) with a minimal placeholder list instead of 404, since several clients (Codex included) poll it. Any other `/v1/*` call is forwarded to the real upstream unchanged.
 
 The default continuation method is a hidden `phase: "commentary"` assistant message (`"Continue thinking..."`). A legacy synthetic tool-pair mode is also available.
 
