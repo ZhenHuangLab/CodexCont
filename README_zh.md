@@ -1,6 +1,8 @@
 # CodexCont
 
-用于 Codex / OpenAI Responses 兼容 API 的“继续思考”中间件。主要可适用于gpt-5.5以及gpt-5.4模型的降智问题，gpt-5.6模型系列尚未测试.
+用于 Codex / OpenAI Responses 兼容 API 的“继续思考”中间件。
+
+经过测试，可适用于gpt-5.6, gpt-5.5以及gpt-5.4模型系列. （即使是最新的gpt-5.6系列，也同样存在类似的推理截断机制）
 
 本项目是一个轻量 Starlette 代理，部署在编码代理和上游 Responses 接口之间。它会检测一种已知的推理截断指纹：`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`。检测到后，中间件会在后台让模型继续思考，并把多轮上游流式响应折叠成一个连贯的下游响应。编码代理既可以用 HTTP（POST + SSE），也可以用 WebSocket 连接本代理；无论哪种方式，代理与上游之间始终是普通的 HTTP+SSE 请求。
 

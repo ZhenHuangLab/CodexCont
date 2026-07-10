@@ -2,7 +2,9 @@
 
 [English](README.md) · [中文](README_zh.md)
 
-Continue-thinking middleware for Codex / OpenAI Responses-compatible APIs. Primarily useful for the intelligence-degradation issues seen with gpt-5.5 and gpt-5.4; the gpt-5.6 model series has not been tested yet.
+Continue-thinking middleware for Codex / OpenAI Responses-compatible APIs.
+
+Tested and applicable to the gpt-5.6, gpt-5.5, and gpt-5.4 model series. (Even the latest gpt-5.6 series exhibits a similar reasoning-truncation mechanism.)
 
 This project is a small Starlette proxy that sits between a coding agent and an upstream Responses endpoint. It detects a known reasoning-truncation fingerprint (`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`), silently asks the model to continue thinking, and folds multiple upstream streaming responses into one coherent downstream response. The agent may speak either HTTP (POST + SSE) or WebSocket to the proxy; either way, the upstream leg is always a plain HTTP+SSE round.
 
